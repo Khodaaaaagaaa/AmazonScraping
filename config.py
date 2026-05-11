@@ -5,12 +5,12 @@ config.py — Configuración central del scraper
 from datetime import date
 
 # ─── CREDENCIALES ────────────────────────────────────────────────────────────
-EMAIL = "analytics@candobrands.com"
-PASSWORD = "Hatchecom2025$"                          
-TOTP_SECRET = "BOTEXJXFCIZAIHLX6GXBEEH4WIIT3ZKBO66HBD4VDEBZGDTCUBYQ"
+EMAIL = ""
+PASSWORD = ""                          
+TOTP_SECRET = ""
 
 # ─── CUENTA ──────────────────────────────────────────────────────────────────
-ACCOUNT_NAME = "Honey Can Do HK Limited"
+ACCOUNT_NAME = ""
 
 # ─── RANGO DE FECHAS ─────────────────────────────────────────────────────────
 START_DATE = date(2026, 1, 2)
@@ -28,12 +28,12 @@ CHROME_PROFILE_DIR = "chrome_profile"
 HEADLESS = False
 
 # ─── URLS ────────────────────────────────────────────────────────────────────
-BASE_URL      = "https://vendorcentral.amazon.com"
-LOGIN_URL     = "https://vendorcentral.amazon.com/signin"
-SALES_URL     = "https://vendorcentral.amazon.com/analytics/dashboard/salesDiagnostic"
-DOWNLOADS_URL = "https://vendorcentral.amazon.com/analytics/dashboard/managedDownloads"
+BASE_URL      = ""
+LOGIN_URL     = ""
+SALES_URL     = ""
+DOWNLOADS_URL = ""
 # ─── SHAREPOINT ──────────────────────────────────────────────────────────────
-SHAREPOINT_SITE_URL    = "https://hatchecom.sharepoint.com/sites/Hatchecom"
-SHAREPOINT_USER        = "carlos.p@hatchecom.com"
-SHAREPOINT_PASSWORD    = "Thor2026!*"   
-SHAREPOINT_FOLDER_PATH = "Shared Documents/Data Manuel Dashboard PBI/DATA MANUAL DOWNLOAD/Honey Can Do Brand LK/00 Sales"
+SHAREPOINT_SITE_URL    = ""
+SHAREPOINT_USER        = ""
+SHAREPOINT_PASSWORD    = ""   
+SHAREPOINT_FOLDER_PATH = ""

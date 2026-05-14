@@ -1,5 +1,5 @@
 """
-main.py — Usa cookies exportadas de Edge para saltear el login
+main.py — Amazon Vendor Central Sales Scraper (multi-cuenta)
 """
 
 import logging
@@ -9,8 +9,11 @@ import time
 from pathlib import Path
 from playwright.sync_api import sync_playwright
 
-from config import START_DATE, END_DATE, OUTPUT_DIR, CHROME_PROFILE_DIR
-from downloader import download_sales_range
+from config import (
+    START_DATE, END_DATE, OUTPUT_DIR, CHROME_PROFILE_DIR,
+    SHAREPOINT_SITE_URL, SHAREPOINT_USER, SHAREPOINT_PASSWORD,
+    ACCOUNTS
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -23,73 +26,117 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 COOKIES_FILE = Path("cookies.json")
+SESSION_FLAG = Path(CHROME_PROFILE_DIR) / "session_ready.txt"
 
 
-def load_cookies(context, cookies_file: Path):
-    """Inyecta las cookies exportadas de Edge en el contexto de Playwright."""
-    logger.info(f"Cargando cookies desde {cookies_file}...")
-    raw = json.loads(cookies_file.read_text(encoding="utf-8"))
-
-    cookies = []
-    for c in raw:
-        cookie = {
-            "name": c["name"],
-            "value": c["value"],
+def load_cookies(context):
+    raw = COOKIES_FILE.read_bytes()
+    if raw.startswith(b'\xef\xbb\xbf'):
+        raw = raw[3:]
+    cookies = json.loads(raw.decode('utf-8'))
+    cleaned = []
+    for c in cookies:
+        cc = {
+            "name": c["name"], "value": c["value"],
             "domain": c.get("domain", ".amazon.com"),
             "path": c.get("path", "/"),
             "secure": c.get("secure", False),
             "httpOnly": c.get("httpOnly", False),
+            "sameSite": c.get("sameSite", "None") or "None"
         }
-        # sameSite debe ser uno de: "Strict", "Lax", "None"
-        same_site = c.get("sameSite", "None")
-        if same_site not in ("Strict", "Lax", "None"):
-            same_site = "None"
-        cookie["sameSite"] = same_site
-
-        # expires: ignorar si es -1 o session cookie
+        if cc["sameSite"] not in ("Strict", "Lax", "None"):
+            cc["sameSite"] = "None"
         if c.get("expirationDate") and c["expirationDate"] > 0:
-            cookie["expires"] = int(c["expirationDate"])
-
-        cookies.append(cookie)
-
-    context.add_cookies(cookies)
-    logger.info(f"✓ {len(cookies)} cookies cargadas.")
+            cc["expires"] = int(c["expirationDate"])
+        cleaned.append(cc)
+    context.add_cookies(cleaned)
+    logger.info(f"✓ {len(cleaned)} cookies cargadas.")
 
 
 def verify_session(page) -> bool:
-    """Verifica que la sesión esté activa con las cookies inyectadas."""
     logger.info("Verificando sesión con cookies...")
-    page.goto("https://vendorcentral.amazon.com", timeout=30000)
+    page.goto("https://vendorcentral.amazon.com", timeout=20000)
     page.wait_for_load_state("domcontentloaded", timeout=15000)
     time.sleep(3)
-
     current_url = page.url
     logger.info(f"URL tras cargar cookies: {current_url}")
-    page.screenshot(path="debug_session_check.png")
-
-    bad_keywords = ["signin", "ap/signin", "ap/mfa", "login", "ap/captcha"]
-    if any(kw in current_url.lower() for kw in bad_keywords):
+    bad = ["signin", "ap/signin", "ap/mfa", "login"]
+    if any(kw in current_url.lower() for kw in bad):
         logger.error("Las cookies no son válidas o expiraron.")
+        logger.error("Cookies inválidas. Exportalas de nuevo desde Edge.")
         return False
-
     logger.info("✓ Sesión activa con cookies.")
     return True
 
 
+def switch_account(page, account_name: str) -> bool:
+    """Cambia la cuenta activa en Vendor Central."""
+    logger.info(f"Cambiando a cuenta: {account_name}")
+    try:
+        # Buscar el dropdown de cuenta en el header
+        page.goto("https://vendorcentral.amazon.com", timeout=20000)
+        page.wait_for_load_state("domcontentloaded", timeout=15000)
+        time.sleep(2)
+
+        # El dropdown de cuenta está en el header
+        account_dropdown = page.locator(f'text="{account_name}"').first
+        if account_dropdown.count() > 0:
+            logger.info(f"✓ Ya en la cuenta correcta: {account_name}")
+            return True
+
+        # Buscar el selector de cuenta (puede ser un <select> o KAT dropdown)
+        selects = page.locator('select').all()
+        for sel in selects:
+            try:
+                opts = sel.inner_text()
+                if account_name in opts:
+                    sel.select_option(label=account_name)
+                    page.wait_for_load_state("domcontentloaded", timeout=10000)
+                    time.sleep(2)
+                    logger.info(f"✓ Cuenta cambiada a: {account_name}")
+                    return True
+            except Exception:
+                pass
+
+        # Intentar via KAT dropdown
+        js_open_dropdown_account = page.evaluate(f"""() => {{
+            const slots = document.querySelectorAll('slot[name="selected-option"]');
+            for (const slot of slots) {{
+                let n = slot;
+                while (n) {{
+                    if (n.tagName && n.tagName.startsWith('KAT-')) {{ n.click(); return true; }}
+                    n = n.parentElement || (n.getRootNode && n.getRootNode().host);
+                }}
+            }}
+            return false;
+        }}""")
+        time.sleep(1)
+
+        opt = page.locator(f'div.standard-option-name').filter(has_text=account_name).first
+        if opt.count() > 0:
+            opt.click()
+            page.wait_for_load_state("domcontentloaded", timeout=10000)
+            time.sleep(2)
+            logger.info(f"✓ Cuenta cambiada a: {account_name}")
+            return True
+
+        logger.warning(f"No se pudo cambiar a la cuenta: {account_name}")
+        return False
+
+    except Exception as e:
+        logger.error(f"Error cambiando cuenta: {e}")
+        return False
+
+
 def main():
     logger.info("=" * 60)
-    logger.info("Amazon Vendor Central — Sales Scraper")
+    logger.info("Amazon Vendor Central — Sales Scraper (Multi-cuenta)")
     logger.info(f"Período : {START_DATE} → {END_DATE}")
+    logger.info(f"Cuentas : {[a['name'] for a in ACCOUNTS]}")
     logger.info("=" * 60)
 
-    # Verificar que existe el archivo de cookies
     if not COOKIES_FILE.exists():
-        logger.error("No se encontró cookies.json")
-        logger.error("Seguí estos pasos:")
-        logger.error("1. Instalá Cookie Editor en Edge")
-        logger.error("2. Andá a vendorcentral.amazon.com logueado")
-        logger.error("3. Abrí Cookie Editor → Export → Export as JSON")
-        logger.error("4. Guardá el contenido en cookies.json en esta carpeta")
+        logger.error("No se encontró cookies.json — exportalas desde Edge.")
         sys.exit(1)
 
     Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
@@ -108,7 +155,6 @@ def main():
                 downloads_path=str(Path(OUTPUT_DIR).resolve()),
             )
         except Exception:
-            logger.info("Edge no disponible, usando Chromium...")
             context = p.chromium.launch_persistent_context(
                 user_data_dir=profile_path,
                 headless=False,
@@ -122,20 +168,37 @@ def main():
         page = context.new_page()
         page.add_init_script("""
             Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-            window.chrome = { runtime: {} };
         """)
 
         try:
-            # Inyectar cookies
-            load_cookies(context, COOKIES_FILE)
+            logger.info("Cargando cookies...")
+            load_cookies(context)
 
-            # Verificar sesión
             if not verify_session(page):
-                logger.error("Cookies inválidas. Exportalas de nuevo desde Edge.")
                 sys.exit(1)
 
-            # Arrancar descarga
-            download_sales_range(page, START_DATE, END_DATE)
+            # Iterar sobre cada cuenta
+            for account in ACCOUNTS:
+                logger.info("\n" + "█"*60)
+                logger.info(f"CUENTA: {account['name']}")
+                logger.info("█"*60)
+
+                # Cambiar a la cuenta correspondiente
+                if not switch_account(page, account["name"]):
+                    logger.warning(f"Saltando cuenta {account['name']}")
+                    continue
+
+                # Importar downloader con contexto de cuenta
+                from downloader import download_all_reports
+                download_all_reports(
+                    page=page,
+                    start=START_DATE,
+                    end=END_DATE,
+                    account=account,
+                )
+
+            logger.info("\n" + "█"*60)
+            logger.info("✓ TODAS LAS CUENTAS PROCESADAS")
 
         except KeyboardInterrupt:
             logger.info("Interrumpido.")

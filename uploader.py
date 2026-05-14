@@ -70,7 +70,7 @@ def get_token(config) -> str | None:
     return None
 
 
-def upload_to_sharepoint(filepath: str, config) -> bool:
+def upload_to_sharepoint(filepath: str, config, sp_base: str = None) -> bool:
     file_path = Path(filepath)
     if not file_path.exists():
         logger.error(f"Archivo no encontrado: {filepath}")
@@ -81,7 +81,7 @@ def upload_to_sharepoint(filepath: str, config) -> bool:
         logger.error("Sin token SharePoint.")
         return False
 
-    folder = get_folder_for_file(file_path.name)
+    folder = get_folder_for_file(file_path.name, sp_base=sp_base)
     logger.info(f"Subiendo {file_path.name} → {folder}")
 
     upload_url = (

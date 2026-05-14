@@ -182,7 +182,19 @@ def click_excel(page: Page) -> bool:
         logger.error(f"Excel error: {e}")
         return False
 
-def download_from_panel(page: Page, report_name: str, filename: str) -> bool:
+def upload_file(filepath: str, account: dict = None):
+    """Sube el archivo a la carpeta correcta de SharePoint."""
+    try:
+        import config as cfg
+        from uploader import upload_to_sharepoint
+        sp_base = account.get("sp_folder") if account else None
+        upload_to_sharepoint(filepath, cfg, sp_base=sp_base)
+    except Exception as e:
+        logger.warning(f"No se pudo subir a SharePoint: {e}")
+
+
+def download_from_panel(page: Page, report_name: str, filename: str,
+                        account: dict = None) -> bool:
     """
     Busca en el panel Manage Downloads el reporte por nombre parcial
     y lo descarga guardándolo como filename en OUTPUT_DIR.
@@ -215,6 +227,7 @@ def download_from_panel(page: Page, report_name: str, filename: str) -> bool:
                             link.click()
                         dl_info.value.save_as(filepath)
                         logger.info(f"✓ Guardado: {filepath}")
+                        upload_file(filepath, account)
                         return True
                 except Exception as e:
                     logger.debug(f"Link error: {e}")
@@ -235,14 +248,16 @@ def download_from_panel(page: Page, report_name: str, filename: str) -> bool:
 # ── Reportes con fecha (loop diario) ──────────────────────────────────────────
 
 def download_daily_report(page: Page, report_key: str, target_date: date,
-                           extra_filters: dict = None) -> bool:
+                           file_suffix: str = "HoneyCanDoHK",
+                           extra_filters: dict = None,
+                           account: dict = None) -> bool:
     """
     Descarga un reporte diario (Sales, Inventory, Traffic, Net PPM).
     extra_filters: dict de {current_value: desired_value} para dropdowns adicionales.
     """
     url = REPORT_URLS[report_key]
     date_tag = f"{target_date.month}-{target_date.day}-{target_date.year}"
-    filename = f"{report_key.upper()}_{target_date.strftime('%Y%m%d')}_HoneyCanDoHK.xlsx"
+    filename = f"{report_key.upper()}_{target_date.strftime('%Y%m%d')}_{file_suffix}.xlsx"
 
     if os.path.exists(os.path.join(OUTPUT_DIR, filename)):
         logger.info(f"Ya existe: {filename}")
@@ -282,18 +297,20 @@ def download_daily_report(page: Page, report_key: str, target_date: date,
     if not click_excel(page):
         return False
 
-    return download_from_panel(page, date_tag, filename)
+    return download_from_panel(page, date_tag, filename, account=account)
 
 
 def download_static_report(page: Page, report_key: str,
-                            filters: dict = None, h1_text: str = None) -> bool:
+                            file_suffix: str = "HoneyCanDoHK",
+                            filters: dict = None, h1_text: str = None,
+                            account: dict = None) -> bool:
     """
     Descarga un reporte sin fecha (Real Time Sales, Forecasting, DF Forecast, Catalog).
     Se descarga una sola vez por ejecución.
     """
     from datetime import datetime
     today = datetime.now().strftime("%Y%m%d")
-    filename = f"{report_key.upper()}_{today}_HoneyCanDoHK.xlsx"
+    filename = f"{report_key.upper()}_{today}_{file_suffix}.xlsx"
 
     logger.info(f"\n{'='*50}")
     logger.info(f"Reporte estático: {report_key.upper()}")
@@ -335,13 +352,21 @@ def download_static_report(page: Page, report_key: str,
         "catalog":     "Catalog",
     }.get(report_key, report_key)
 
-    return download_from_panel(page, search_term, filename)
+    return download_from_panel(page, search_term, filename, account=account)
 
 
 # ── Orquestador principal ──────────────────────────────────────────────────────
 
-def download_all_reports(page: Page, start: date, end: date):
+def download_all_reports(page: Page, start: date, end: date, account: dict = None):
     setup_output_dir()
+
+    # Configurar cuenta
+    if account is None:
+        from config import ACCOUNTS
+        account = ACCOUNTS[0]
+
+    file_suffix = account.get("file_suffix", "HoneyCanDoHK")
+    has_df = account.get("has_df_forecast", True)
 
     all_dates = []
     d = start
@@ -350,8 +375,9 @@ def download_all_reports(page: Page, start: date, end: date):
         d += timedelta(days=1)
 
     logger.info(f"Total días: {len(all_dates)} ({start} → {end})")
-    logger.info("Reportes a descargar: Sales, Real Time Sales, Inventory, Traffic,")
-    logger.info("                      Forecasting, Direct Fulfillment, Net PPM, Catalog")
+    logger.info(f"Cuenta: {account['name']} | Sufijo: {file_suffix}")
+    logger.info("Reportes: Sales, Real Time Sales, Inventory, Traffic,")
+    logger.info("          Forecasting, Direct Fulfillment, Net PPM, Catalog")
 
     total = 0
 
@@ -359,25 +385,25 @@ def download_all_reports(page: Page, start: date, end: date):
     logger.info("\n" + "█"*50)
     logger.info("SECCIÓN 1: SALES")
     for d in all_dates:
-        ok = download_daily_report(page, "sales", d,
-             extra_filters={"Manufacturing": "Sourcing"})
+        ok = download_daily_report(page, "sales", d, file_suffix,
+             extra_filters={"Manufacturing": "Sourcing"}, account=account)
         if ok: total += 1
         random_delay()
 
     # ── 2. Real Time Sales (estático, solo una vez) ────────────────────────────
     logger.info("\n" + "█"*50)
     logger.info("SECCIÓN 2: REAL TIME SALES")
-    ok = download_static_report(page, "realtime",
+    ok = download_static_report(page, "realtime", file_suffix,
          filters={"Trailing 24 hours": "Trailing 48 hours"},
-         h1_text="Real Time Sales")
+         h1_text="Real Time Sales", account=account)
     if ok: total += 1
 
     # ── 3. Inventory (diario) ──────────────────────────────────────────────────
     logger.info("\n" + "█"*50)
     logger.info("SECCIÓN 3: INVENTORY")
     for d in all_dates:
-        ok = download_daily_report(page, "inventory", d,
-             extra_filters={"Manufacturing": "Sourcing"})
+        ok = download_daily_report(page, "inventory", d, file_suffix,
+             extra_filters={"Manufacturing": "Sourcing"}, account=account)
         if ok: total += 1
         random_delay()
 
@@ -386,41 +412,41 @@ def download_all_reports(page: Page, start: date, end: date):
     logger.info("SECCIÓN 4: TRAFFIC")
     for d in all_dates:
         # Traffic no tiene Distributor View
-        ok = download_daily_report(page, "traffic", d)
+        ok = download_daily_report(page, "traffic", d, file_suffix, account=account)
         if ok: total += 1
         random_delay()
 
     # ── 5. Forecasting (estático) ──────────────────────────────────────────────
     logger.info("\n" + "█"*50)
     logger.info("SECCIÓN 5: FORECASTING")
-    ok = download_static_report(page, "forecasting",
+    ok = download_static_report(page, "forecasting", file_suffix,
          filters={"Manufacturing": "Retail", "Mean Forecast": "Mean Forecast"},
-         h1_text="Forecasting")
+         h1_text="Forecasting", account=account)
     if ok: total += 1
 
     # ── 6. Direct Fulfillment Forecasting (estático) ───────────────────────────
     logger.info("\n" + "█"*50)
     logger.info("SECCIÓN 6: DIRECT FULFILLMENT FORECASTING")
-    ok = download_static_report(page, "df_forecast",
+    ok = download_static_report(page, "df_forecast", file_suffix,
          filters={"Region": "Warehouse", "Mean Forecast": "Mean Forecast"},
-         h1_text="Direct Fulfillment")
+         h1_text="Direct Fulfillment", account=account) if has_df is not False else None
     if ok: total += 1
 
     # ── 7. Net PPM (diario) ────────────────────────────────────────────────────
     logger.info("\n" + "█"*50)
     logger.info("SECCIÓN 7: NET PPM")
     for d in all_dates:
-        ok = download_daily_report(page, "netppm", d,
-             extra_filters={"Manufacturing": "Sourcing"})
+        ok = download_daily_report(page, "netppm", d, file_suffix,
+             extra_filters={"Manufacturing": "Sourcing"}, account=account)
         if ok: total += 1
         random_delay()
 
     # ── 8. Catalog (estático) ──────────────────────────────────────────────────
     logger.info("\n" + "█"*50)
     logger.info("SECCIÓN 8: CATALOG")
-    ok = download_static_report(page, "catalog",
+    ok = download_static_report(page, "catalog", file_suffix,
          filters={"Manufacturing": "Sourcing"},
-         h1_text="Catalog")
+         h1_text="Catalog", account=account)
     if ok: total += 1
 
     logger.info(f"\n{'█'*50}")
@@ -429,4 +455,5 @@ def download_all_reports(page: Page, start: date, end: date):
 
 # Mantener compatibilidad con main.py que llama download_sales_range
 def download_sales_range(page: Page, start: date, end: date):
-    download_all_reports(page, start, end)
+    from config import ACCOUNTS
+    download_all_reports(page, start, end, account=ACCOUNTS[0])

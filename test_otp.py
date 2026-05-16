@@ -30,5 +30,5 @@ def test_totp():
     print("   Si coinciden, tu TOTP_SECRET está bien configurado.")
 
 
-if __name__ == "__main__":
+if _name_ == "_main_":
     test_totp()

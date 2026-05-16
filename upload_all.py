@@ -7,7 +7,7 @@ from pathlib import Path
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s",
                     handlers=[logging.StreamHandler(sys.stdout)])
-logger = logging.getLogger(__name__)
+logger = logging.getLogger(_name_)
 
 import config as cfg
 from uploader import get_token, get_folder_for_file
@@ -56,5 +56,5 @@ def upload_all():
 
     logger.info(f"\nSubidos: {ok} | Errores: {fail}")
 
-if __name__ == "__main__":
+if _name_ == "_main_":
     upload_all()

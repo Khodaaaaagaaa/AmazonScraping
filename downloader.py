@@ -2,7 +2,7 @@
 downloader.py — Descarga los 8 reportes de Retail Analytics
 """
 
-import time, random, logging, os, re
+import time, random, logging, os, re, json
 from datetime import date, timedelta
 from pathlib import Path
 from playwright.sync_api import Page
@@ -24,6 +24,69 @@ REPORT_URLS = {
     "netppm":       f"{BASE}/net-ppm",
     "catalog":      f"{BASE}/product-catalog",
 }
+
+REPORT_H1_TEXT = {
+    "sales":     "Sales",
+    "inventory": "Inventory",
+    "traffic":   "Traffic",
+    "netppm":    "Net PPM",
+}
+
+# JavaScript helper para recorrer shadow DOM (también lo importa ads_downloader.py)
+_GET_ALL_FN = """function getAll(root) {
+    var nodes = [];
+    try {
+        var tw = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
+        var n; while (n = tw.nextNode()) { nodes.push(n); if (n.shadowRoot) nodes = nodes.concat(getAll(n.shadowRoot)); }
+    } catch(e) {}
+    return nodes;
+}"""
+
+
+# ── Utilidades de página ──────────────────────────────────────────────────────
+
+def ensure_page(context, page):
+    """Devuelve la página si sigue activa; si no, abre una nueva."""
+    try:
+        page.evaluate("1")
+        return page
+    except Exception:
+        return context.new_page()
+
+
+def upload_file(filepath: str, account: dict = None):
+    """Sube el archivo a SharePoint en la carpeta correcta para la cuenta indicada."""
+    try:
+        from uploader import upload_to_sharepoint
+        upload_to_sharepoint(filepath, account)
+    except Exception as e:
+        logger.warning(f"upload_file: {e}")
+
+
+def stamp_download_date(filepath: str):
+    """
+    Inyecta la fecha/hora de descarga en el archivo Excel:
+      - Propiedad del documento (Description)
+      - Hoja 'Metadata' con fecha y hora legibles
+    """
+    try:
+        import openpyxl
+        from datetime import datetime
+        wb = openpyxl.load_workbook(filepath)
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        wb.properties.description = f"Download Date: {now}"
+        if "Metadata" not in wb.sheetnames:
+            ws = wb.create_sheet("Metadata")
+        else:
+            ws = wb["Metadata"]
+        ws["A1"] = "Download Date"
+        ws["B1"] = now
+        wb.save(filepath)
+        logger.info(f"✓ Fecha de descarga añadida: {now}")
+    except ImportError:
+        logger.warning("openpyxl no instalado — fecha no añadida (pip install openpyxl)")
+    except Exception as e:
+        logger.warning(f"stamp_download_date: {e}")
 
 
 def random_delay():
@@ -113,7 +176,6 @@ def click_apply(page: Page):
     try:
         apply = page.locator('button:has-text("Apply")').first
         apply.wait_for(timeout=5000, state="visible")
-        # Esperar que se habilite
         for _ in range(15):
             if apply.is_enabled():
                 break
@@ -169,42 +231,130 @@ def click_excel(page: Page) -> bool:
         excel = page.locator('button:has-text("Excel")').first
         excel.wait_for(timeout=8000, state="visible")
         excel.click()
+
         time.sleep(2)
+
         warn = page.locator('text=/exceeded/i, text=/superado/i').first
+
         if warn.count() > 0:
             logger.warning("Límite detectado — esperando 6 min...")
             time.sleep(360)
+
             excel.click()
             time.sleep(2)
+
         logger.info("✓ Excel solicitado.")
         return True
+
     except Exception as e:
         logger.error(f"Excel error: {e}")
         return False
 
-def upload_file(filepath: str, account: dict = None):
-    """Sube el archivo a la carpeta correcta de SharePoint."""
-    try:
-        import config as cfg
-        from uploader import upload_to_sharepoint
-        sp_base = account.get("sp_folder") if account else None
-        upload_to_sharepoint(filepath, cfg, sp_base=sp_base)
-    except Exception as e:
-        logger.warning(f"No se pudo subir a SharePoint: {e}")
+
+# JavaScript para encontrar el Download link EXACTO de un reporte en el panel.
+# Evita el bug de ancestor::div[4] que devuelve el panel entero y matchea cualquier fila.
+# Estrategia: encuentra un elemento PEQUEÑO con el texto buscado (una celda, no el panel),
+# luego sube por el DOM hasta encontrar el ancestro MÁS PEQUEÑO que tenga ESE texto
+# Y un link "Download" — eso es la fila correcta.
+_JS_FIND_AND_CLICK_DOWNLOAD = """(searchTerm) => {
+    function getAll(root) {
+        var nodes = [];
+        try {
+            var tw = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
+            var n; while (n = tw.nextNode()) {
+                nodes.push(n);
+                if (n.shadowRoot) nodes = nodes.concat(getAll(n.shadowRoot));
+            }
+        } catch(e) {}
+        return nodes;
+    }
+    function crossParent(el) {
+        if (el.parentElement) return el.parentElement;
+        var r = el.getRootNode();
+        return (r && r !== document && r.host) ? r.host : null;
+    }
+
+    var all = getAll(document);
+    var term = searchTerm.toLowerCase();
+
+    // Paso 1: encontrar elementos PEQUEÑOS que contengan nuestro término
+    // (celdas individuales de la fila, no contenedores grandes del panel)
+    var candidates = [];
+    for (var i = 0; i < all.length; i++) {
+        var el = all[i];
+        var txt = (el.textContent || '').trim();
+        if (!txt.toLowerCase().includes(term)) continue;
+        if (txt.length > 200) continue;         // descartar contenedores grandes
+        if (el.childElementCount > 4) continue; // descartar elementos complejos
+        candidates.push(el);
+    }
+
+    if (candidates.length === 0) {
+        var inProg = all.filter(function(n) {
+            var t = (n.textContent||'').trim().toLowerCase();
+            return t==='in progress'||t==='generating'||t==='processing'||t==='pending';
+        }).length;
+        return JSON.stringify({status:'term_not_found', term:searchTerm, in_progress:inProg});
+    }
+
+    // Paso 2: para cada candidato, subir por el DOM buscando el ancestro MÁS PEQUEÑO
+    // que tenga tanto nuestro término como un link "Download"
+    for (var ci = 0; ci < candidates.length; ci++) {
+        var ancestor = crossParent(candidates[ci]);
+        for (var up = 0; up < 12 && ancestor; up++) {
+            var aTxt = (ancestor.textContent || '').trim();
+
+            // Si este ancestro no tiene nuestro término, subir más
+            if (!aTxt.toLowerCase().includes(term)) {
+                ancestor = crossParent(ancestor);
+                continue;
+            }
+            // Si el ancestro es demasiado grande, es el panel completo — subir más
+            if (aTxt.length > 1200) {
+                ancestor = crossParent(ancestor);
+                continue;
+            }
+
+            // Buscar link "Download" dentro de este ancestro
+            var sub = getAll(ancestor);
+            for (var si = 0; si < sub.length; si++) {
+                var node = sub[si];
+                var nTxt = (node.textContent || '').trim();
+                var nTag = (node.tagName || '').toLowerCase();
+                if (nTxt === 'Download' && (nTag==='a'||nTag==='button'||nTag==='span')) {
+                    node.click();
+                    return JSON.stringify({
+                        status: 'clicked',
+                        term: searchTerm,
+                        match: candidates[ci].textContent.trim().substring(0,80),
+                        rowText: aTxt.substring(0,150)
+                    });
+                }
+            }
+            ancestor = crossParent(ancestor);
+        }
+    }
+
+    var inProgress = all.filter(function(n) {
+        var t = (n.textContent||'').trim().toLowerCase();
+        return t==='in progress'||t==='generating'||t==='processing'||t==='pending';
+    }).length;
+    return JSON.stringify({status:'no_download_link', term:searchTerm, in_progress:inProgress});
+}"""
 
 
-def download_from_panel(page: Page, report_name: str, filename: str,
-                        account: dict = None) -> bool:
+def download_from_panel(page: Page, report_name: str, filename: str = None) -> tuple:
     """
-    Busca en el panel Manage Downloads el reporte por nombre parcial
-    y lo descarga guardándolo como filename en OUTPUT_DIR.
+    Busca en Manage Downloads el reporte EXACTO por nombre y lo descarga.
+    Usa shadow DOM traversal para identificar la fila correcta
+    (evita el bug de ancestor::div[4] que capturaba el panel completo).
+    Retorna (success: bool, filepath: str | None).
     """
-    filepath = os.path.join(OUTPUT_DIR, filename)
     deadline = time.time() + REPORT_TIMEOUT_SEC
-
     logger.info(f"Esperando reporte '{report_name}' en Manage Downloads...")
 
     while time.time() < deadline:
+        # Abrir el panel de downloads
         try:
             page.evaluate("document.getElementById('downloadManager').click()")
             time.sleep(2)
@@ -213,26 +363,39 @@ def download_from_panel(page: Page, report_name: str, filename: str,
             time.sleep(5)
             continue
 
+        # Buscar la fila exacta del reporte y descargar
+        result_raw = None
         try:
-            links = page.locator('a:has-text("Download")').all()
-            logger.info(f"Links Download en panel: {len(links)}")
-            for link in links:
-                try:
-                    row = link.locator('xpath=ancestor::div[4]').first
-                    row_text = row.inner_text()
-                    logger.info(f"Fila: {row_text[:120]}")
-                    if report_name.lower() in row_text.lower():
-                        logger.info(f"✓ Reporte encontrado. Descargando...")
-                        with page.expect_download(timeout=60000) as dl_info:
-                            link.click()
-                        dl_info.value.save_as(filepath)
-                        logger.info(f"✓ Guardado: {filepath}")
-                        upload_file(filepath, account)
-                        return True
-                except Exception as e:
-                    logger.debug(f"Link error: {e}")
+            with page.expect_download(timeout=15000) as dl_info:
+                result_raw = page.evaluate(_JS_FIND_AND_CLICK_DOWNLOAD, report_name)
+
+            # Si llegamos aquí sin excepción, se inició una descarga
+            try:
+                logger.info(f"JS resultado: {json.loads(result_raw)}")
+            except Exception:
+                pass
+
+            dl = dl_info.value
+            amazon_filename = dl.suggested_filename
+            save_name = filename if filename else amazon_filename
+            filepath = os.path.join(OUTPUT_DIR, save_name)
+            logger.info(f"Nombre Amazon: {amazon_filename} → guardando como: {save_name}")
+            dl.save_as(filepath)
+            logger.info(f"✓ Guardado: {filepath}")
+            return True, filepath
+
         except Exception as e:
-            logger.warning(f"Error leyendo panel: {e}")
+            err_str = str(e).lower()
+            if "timeout" in err_str:
+                if result_raw:
+                    try:
+                        logger.info(f"Estado panel: {json.loads(result_raw)}")
+                    except Exception:
+                        logger.info(f"Estado panel: {result_raw}")
+                else:
+                    logger.info(f"Reporte '{report_name}' aún no disponible.")
+            else:
+                logger.warning(f"download_from_panel: {e}")
 
         logger.info(f"No listo. Esperando {POLL_INTERVAL_SEC}s...")
         try:
@@ -241,20 +404,20 @@ def download_from_panel(page: Page, report_name: str, filename: str,
             pass
         time.sleep(POLL_INTERVAL_SEC)
 
-    logger.error(f"Timeout para {filename}")
-    return False
+    logger.error(f"Timeout para '{report_name}'")
+    return False, None
 
 
 # ── Reportes con fecha (loop diario) ──────────────────────────────────────────
 
 def download_daily_report(page: Page, report_key: str, target_date: date,
-                           file_suffix: str = "HoneyCanDoHK",
                            extra_filters: dict = None,
                            account: dict = None) -> bool:
     """
     Descarga un reporte diario (Sales, Inventory, Traffic, Net PPM).
-    extra_filters: dict de {current_value: desired_value} para dropdowns adicionales.
+    Añade timestamp de descarga al archivo descargado.
     """
+    file_suffix = account.get("file_suffix", "HoneyCanDoHK") if account else "HoneyCanDoHK"
     url = REPORT_URLS[report_key]
     date_tag = f"{target_date.month}-{target_date.day}-{target_date.year}"
     filename = f"{report_key.upper()}_{target_date.strftime('%Y%m%d')}_{file_suffix}.xlsx"
@@ -267,25 +430,22 @@ def download_daily_report(page: Page, report_key: str, target_date: date,
     logger.info(f"Reporte: {report_key.upper()} | Fecha: {target_date}")
 
     page.goto(url, timeout=40000)
-    page.locator(f'h1:has-text("{report_key.replace("_"," ").title()}")').first.wait_for(timeout=20000)
+    h1 = REPORT_H1_TEXT.get(report_key, report_key.replace("_", " ").title())
+    page.locator(f'h1:has-text("{h1}")').first.wait_for(timeout=20000)
     time.sleep(2)
 
-    # Filtros base: Daily + fecha
     kat_select(page, "Custom", "Daily")
     time.sleep(1)
     set_date(page, target_date)
 
-    # Filtros extra (ej: Distributor View, Program View)
     if extra_filters:
         for current, desired in extra_filters.items():
             kat_select(page, current, desired)
 
     click_apply(page)
 
-    # Customize Columns si no están todas
     if not columns_are_complete(page):
         select_all_columns(page)
-        # Re-aplicar filtros
         kat_select(page, "Custom", "Daily")
         time.sleep(1)
         set_date(page, target_date)
@@ -297,23 +457,37 @@ def download_daily_report(page: Page, report_key: str, target_date: date,
     if not click_excel(page):
         return False
 
-    return download_from_panel(page, date_tag, filename, account=account)
+    ok, filepath = download_from_panel(page, date_tag, filename)
+    if ok and filepath:
+        stamp_download_date(filepath)
+        upload_file(filepath, account)
+    return ok
 
 
 def download_static_report(page: Page, report_key: str,
-                            file_suffix: str = "HoneyCanDoHK",
                             filters: dict = None, h1_text: str = None,
                             account: dict = None) -> bool:
     """
     Descarga un reporte sin fecha (Real Time Sales, Forecasting, DF Forecast, Catalog).
-    Se descarga una sola vez por ejecución.
+    Añade timestamp de descarga al archivo — crítico para estos reportes
+    ya que Amazon no incluye fecha en el nombre del archivo.
+    Usa date_tag de hoy (mismo formato que Sales) para identificar la fila exacta
+    en Manage Downloads — proceso idéntico al de Sales.
     """
     from datetime import datetime
-    today = datetime.now().strftime("%Y%m%d")
-    filename = f"{report_key.upper()}_{today}_{file_suffix}.xlsx"
+    file_suffix = account.get("file_suffix", "HoneyCanDoHK") if account else "HoneyCanDoHK"
+    now = datetime.now()
+    today = now.date()
+    today_str = now.strftime("%Y%m%d")
+    filename = f"{report_key.upper()}_{today_str}_{file_suffix}.xlsx"
+
+    # Formato con barras: "M/D/YYYY" — es como Amazon muestra "Date Requested" en el panel.
+    # Para reportes diarios el date_tag usa guiones porque aparece en el NOMBRE del archivo.
+    # Para reportes estáticos no hay fecha en el nombre, solo en "Date Requested" (barras).
+    date_tag = f"{today.month}/{today.day}/{today.year}"
 
     logger.info(f"\n{'='*50}")
-    logger.info(f"Reporte estático: {report_key.upper()}")
+    logger.info(f"Reporte estático: {report_key.upper()} | Buscando en panel: '{date_tag}'")
 
     url = REPORT_URLS[report_key]
     page.goto(url, timeout=40000)
@@ -325,7 +499,6 @@ def download_static_report(page: Page, report_key: str,
         time.sleep(3)
     time.sleep(2)
 
-    # Aplicar filtros específicos
     if filters:
         for current, desired in filters.items():
             kat_select(page, current, desired)
@@ -333,7 +506,6 @@ def download_static_report(page: Page, report_key: str,
     click_apply(page)
     time.sleep(2)
 
-    # Customize Columns
     if not columns_are_complete(page):
         select_all_columns(page)
         if filters:
@@ -344,29 +516,32 @@ def download_static_report(page: Page, report_key: str,
     if not click_excel(page):
         return False
 
-    # Para reportes estáticos buscamos por tipo de reporte en el nombre
-    search_term = {
-        "realtime":    "Real_Time",
-        "forecasting": "Forecasting",
-        "df_forecast": "DF",
-        "catalog":     "Catalog",
-    }.get(report_key, report_key)
-
-    return download_from_panel(page, search_term, filename, account=account)
+    ok, filepath = download_from_panel(page, date_tag, filename)
+    if ok and filepath:
+        stamp_download_date(filepath)
+        upload_file(filepath, account)
+    return ok
 
 
 # ── Orquestador principal ──────────────────────────────────────────────────────
 
-def download_all_reports(page: Page, start: date, end: date, account: dict = None):
+def download_all_reports(page: Page, start: date, end: date,
+                          context=None, account: dict = None,
+                          reports_to_run=None) -> Page:
+    """
+    Descarga todos los reportes de Retail Analytics seleccionados.
+
+    reports_to_run: "all"  →  descarga los 8 reportes
+                   lista   →  solo los reportes cuya clave esté en la lista
+                              ej: ["sales", "inventory", "traffic"]
+    """
     setup_output_dir()
 
-    # Configurar cuenta
-    if account is None:
-        from config import ACCOUNTS
-        account = ACCOUNTS[0]
+    run_all = (reports_to_run is None or reports_to_run == "all")
+    selected = set() if run_all else set(reports_to_run)
 
-    file_suffix = account.get("file_suffix", "HoneyCanDoHK")
-    has_df = account.get("has_df_forecast", True)
+    def should_run(key: str) -> bool:
+        return run_all or key in selected
 
     all_dates = []
     d = start
@@ -375,85 +550,94 @@ def download_all_reports(page: Page, start: date, end: date, account: dict = Non
         d += timedelta(days=1)
 
     logger.info(f"Total días: {len(all_dates)} ({start} → {end})")
-    logger.info(f"Cuenta: {account['name']} | Sufijo: {file_suffix}")
-    logger.info("Reportes: Sales, Real Time Sales, Inventory, Traffic,")
-    logger.info("          Forecasting, Direct Fulfillment, Net PPM, Catalog")
+    if not run_all:
+        logger.info(f"Reportes seleccionados: {sorted(selected)}")
 
     total = 0
 
-    # ── 1. Sales (diario) ──────────────────────────────────────────────────────
-    logger.info("\n" + "█"*50)
-    logger.info("SECCIÓN 1: SALES")
-    for d in all_dates:
-        ok = download_daily_report(page, "sales", d, file_suffix,
-             extra_filters={"Manufacturing": "Sourcing"}, account=account)
+    # ── 1. Sales ──────────────────────────────────────────────────────────────
+    if should_run("sales"):
+        logger.info("\n" + "█"*50)
+        logger.info("SECCIÓN 1: SALES")
+        for d in all_dates:
+            ok = download_daily_report(page, "sales", d,
+                 extra_filters={"Manufacturing": "Sourcing"}, account=account)
+            if ok: total += 1
+            random_delay()
+
+    # ── 2. Real Time Sales ────────────────────────────────────────────────────
+    if should_run("realtime"):
+        logger.info("\n" + "█"*50)
+        logger.info("SECCIÓN 2: REAL TIME SALES")
+        ok = download_static_report(page, "realtime",
+             filters={"Trailing 24 hours": "Trailing 48 hours"},
+             h1_text="Real Time Sales", account=account)
         if ok: total += 1
-        random_delay()
 
-    # ── 2. Real Time Sales (estático, solo una vez) ────────────────────────────
-    logger.info("\n" + "█"*50)
-    logger.info("SECCIÓN 2: REAL TIME SALES")
-    ok = download_static_report(page, "realtime", file_suffix,
-         filters={"Trailing 24 hours": "Trailing 48 hours"},
-         h1_text="Real Time Sales", account=account)
-    if ok: total += 1
+    # ── 3. Inventory ──────────────────────────────────────────────────────────
+    if should_run("inventory"):
+        logger.info("\n" + "█"*50)
+        logger.info("SECCIÓN 3: INVENTORY")
+        for d in all_dates:
+            ok = download_daily_report(page, "inventory", d,
+                 extra_filters={"Manufacturing": "Sourcing"}, account=account)
+            if ok: total += 1
+            random_delay()
 
-    # ── 3. Inventory (diario) ──────────────────────────────────────────────────
-    logger.info("\n" + "█"*50)
-    logger.info("SECCIÓN 3: INVENTORY")
-    for d in all_dates:
-        ok = download_daily_report(page, "inventory", d, file_suffix,
-             extra_filters={"Manufacturing": "Sourcing"}, account=account)
+    # ── 4. Traffic ────────────────────────────────────────────────────────────
+    if should_run("traffic"):
+        logger.info("\n" + "█"*50)
+        logger.info("SECCIÓN 4: TRAFFIC")
+        for d in all_dates:
+            ok = download_daily_report(page, "traffic", d, account=account)
+            if ok: total += 1
+            random_delay()
+
+    # ── 5. Forecasting ────────────────────────────────────────────────────────
+    if should_run("forecasting"):
+        logger.info("\n" + "█"*50)
+        logger.info("SECCIÓN 5: FORECASTING")
+        ok = download_static_report(page, "forecasting",
+             filters={"Manufacturing": "Retail", "Mean Forecast": "Mean Forecast"},
+             h1_text="Forecasting", account=account)
         if ok: total += 1
-        random_delay()
 
-    # ── 4. Traffic (diario) ────────────────────────────────────────────────────
-    logger.info("\n" + "█"*50)
-    logger.info("SECCIÓN 4: TRAFFIC")
-    for d in all_dates:
-        # Traffic no tiene Distributor View
-        ok = download_daily_report(page, "traffic", d, file_suffix, account=account)
+    # ── 6. Direct Fulfillment Forecasting ─────────────────────────────────────
+    if should_run("df_forecast"):
+        logger.info("\n" + "█"*50)
+        logger.info("SECCIÓN 6: DIRECT FULFILLMENT FORECASTING")
+        has_df = (account or {}).get("has_df_forecast", False)
+        if has_df:
+            ok = download_static_report(page, "df_forecast",
+                 h1_text="Direct Fulfillment Forecasting", account=account)
+            if ok: total += 1
+        else:
+            logger.info("→ Esta cuenta no tiene Direct Fulfillment Forecasting. Saltando.")
+
+    # ── 7. Net PPM ────────────────────────────────────────────────────────────
+    if should_run("netppm"):
+        logger.info("\n" + "█"*50)
+        logger.info("SECCIÓN 7: NET PPM")
+        for d in all_dates:
+            ok = download_daily_report(page, "netppm", d,
+                 extra_filters={"Manufacturing": "Sourcing"}, account=account)
+            if ok: total += 1
+            random_delay()
+
+    # ── 8. Catalog ────────────────────────────────────────────────────────────
+    if should_run("catalog"):
+        logger.info("\n" + "█"*50)
+        logger.info("SECCIÓN 8: CATALOG")
+        ok = download_static_report(page, "catalog",
+             filters={"Manufacturing": "Sourcing"},
+             h1_text="Catalog", account=account)
         if ok: total += 1
-        random_delay()
-
-    # ── 5. Forecasting (estático) ──────────────────────────────────────────────
-    logger.info("\n" + "█"*50)
-    logger.info("SECCIÓN 5: FORECASTING")
-    ok = download_static_report(page, "forecasting", file_suffix,
-         filters={"Manufacturing": "Retail", "Mean Forecast": "Mean Forecast"},
-         h1_text="Forecasting", account=account)
-    if ok: total += 1
-
-    # ── 6. Direct Fulfillment Forecasting (estático) ───────────────────────────
-    logger.info("\n" + "█"*50)
-    logger.info("SECCIÓN 6: DIRECT FULFILLMENT FORECASTING")
-    ok = download_static_report(page, "df_forecast", file_suffix,
-         filters={"Region": "Warehouse", "Mean Forecast": "Mean Forecast"},
-         h1_text="Direct Fulfillment", account=account) if has_df is not False else None
-    if ok: total += 1
-
-    # ── 7. Net PPM (diario) ────────────────────────────────────────────────────
-    logger.info("\n" + "█"*50)
-    logger.info("SECCIÓN 7: NET PPM")
-    for d in all_dates:
-        ok = download_daily_report(page, "netppm", d, file_suffix,
-             extra_filters={"Manufacturing": "Sourcing"}, account=account)
-        if ok: total += 1
-        random_delay()
-
-    # ── 8. Catalog (estático) ──────────────────────────────────────────────────
-    logger.info("\n" + "█"*50)
-    logger.info("SECCIÓN 8: CATALOG")
-    ok = download_static_report(page, "catalog", file_suffix,
-         filters={"Manufacturing": "Sourcing"},
-         h1_text="Catalog", account=account)
-    if ok: total += 1
 
     logger.info(f"\n{'█'*50}")
     logger.info(f"✓ COMPLETO. Total archivos descargados: {total}")
+    return page
 
 
-# Mantener compatibilidad con main.py que llama download_sales_range
 def download_sales_range(page: Page, start: date, end: date):
-    from config import ACCOUNTS
-    download_all_reports(page, start, end, account=ACCOUNTS[0])
+    """Compatibilidad con código anterior."""
+    download_all_reports(page, start, end)

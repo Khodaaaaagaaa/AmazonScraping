@@ -1,38 +1,65 @@
 """
-uploader.py — Sube archivos a SharePoint en la carpeta correcta según el tipo de reporte
+uploader.py — Sube archivos a SharePoint en la carpeta correcta según el tipo de reporte.
+              Soporta múltiples cuentas: si se pasa un dict 'account' con 'sp_folder',
+              usa esa ruta como base; si no, usa config.SHAREPOINT_BASE_PATH.
 """
 import logging
 import requests
 from pathlib import Path
+
+import config as _cfg
 
 logger = logging.getLogger(__name__)
 
 TENANT_ID  = "fdac34dd-697c-497a-aa80-23c83ef6527c"
 CLIENT_ID  = "d3590ed6-52b3-4102-aeff-aad2292ab01c"
 TOKEN_FILE = Path("sharepoint_token.json")
-BASE_PATH  = "Shared Documents/Data Manuel Dashboard PBI/DATA MANUAL DOWNLOAD/Honey Can Do Brand LK"
 
-FOLDER_MAP = {
-    "SALES":       f"{BASE_PATH}/00 Sales",
-    "REALTIME":    f"{BASE_PATH}/01 Real Time Sales",
-    "INVENTORY":   f"{BASE_PATH}/02 Inventory",
-    "TRAFFIC":     f"{BASE_PATH}/03 Traffic",
-    "FORECASTING": f"{BASE_PATH}/04 Forecasting",
-    "DF_FORECAST": f"{BASE_PATH}/04 Forecasting",
-    "NETPPM":      f"{BASE_PATH}/05 Net PPM",
-    "CATALOG":     f"{BASE_PATH}/06 Catalog",
+# Subcarpetas relativas a la carpeta base de la cuenta.
+# Las claves son prefijos del nombre de archivo EN MAYÚSCULAS.
+# Se incluyen variantes porque Amazon puede nombrar los archivos de distintas formas.
+# Orden: más específicos primero para evitar matches parciales incorrectos.
+RELATIVE_FOLDERS = {
+    "REAL_TIME":    "01 Real Time Sales",   # Amazon: Real_Time_Sales_...
+    "REALTIME":     "01 Real Time Sales",   # por si empieza sin guión bajo
+    "DF_FORECAST":  "04 Forecasting",       # clave interna
+    "DF":           "04 Forecasting",       # Amazon: DF_Forecasting_...
+    "FORECASTING":  "04 Forecasting",
+    "NET_PPM":      "05 Net PPM",           # Amazon: Net_PPM_...
+    "NETPPM":       "05 Net PPM",           # clave interna
+    "SALES":        "00 Sales",
+    "INVENTORY":    "02 Inventory",
+    "TRAFFIC":      "03 Traffic",
+    "CATALOG":      "06 Catalog",
 }
 
 
-def get_folder_for_file(filename: str) -> str:
+def get_base_path(account: dict = None) -> str:
+    """
+    Devuelve la ruta base de SharePoint para la cuenta indicada.
+    Si 'account' tiene 'sp_folder', usa ese valor.
+    Si no, usa config.SHAREPOINT_BASE_PATH.
+    """
+    if account and account.get("sp_folder"):
+        return account["sp_folder"]
+    return _cfg.SHAREPOINT_BASE_PATH
+
+
+def get_folder_for_file(filename: str, base_path: str) -> str:
+    """
+    Determina la subcarpeta de destino a partir del nombre del archivo.
+    Retorna la ruta completa: base_path + subcarpeta.
+    """
     name_upper = Path(filename).name.upper()
-    for prefix, folder in FOLDER_MAP.items():
+    for prefix, subfolder in RELATIVE_FOLDERS.items():
         if name_upper.startswith(prefix):
-            return folder
-    return FOLDER_MAP["SALES"]
+            return f"{base_path}/{subfolder}"
+    logger.warning(f"Sin carpeta específica para '{filename}'; usando '00 Sales' como fallback.")
+    return f"{base_path}/00 Sales"
 
 
-def get_token(config) -> str | None:
+def get_token() -> str | None:
+    """Obtiene (o refresca) el token de SharePoint con MSAL."""
     try:
         import msal
     except ImportError:
@@ -50,7 +77,7 @@ def get_token(config) -> str | None:
     )
     scopes = ["https://hatchecom.sharepoint.com/.default"]
 
-    accounts = app.get_accounts(username=config.SHAREPOINT_USER)
+    accounts = app.get_accounts(username=_cfg.SHAREPOINT_USER)
     if accounts:
         r = app.acquire_token_silent(scopes, account=accounts[0])
         if r and "access_token" in r:
@@ -58,34 +85,44 @@ def get_token(config) -> str | None:
             return r["access_token"]
 
     r = app.acquire_token_by_username_password(
-        username=config.SHAREPOINT_USER,
-        password=config.SHAREPOINT_PASSWORD,
+        username=_cfg.SHAREPOINT_USER,
+        password=_cfg.SHAREPOINT_PASSWORD,
         scopes=scopes,
     )
     if "access_token" in r:
         TOKEN_FILE.write_text(cache.serialize())
         return r["access_token"]
 
-    logger.error(f"No se pudo obtener token: {r.get('error_description','')}")
+    logger.error(f"No se pudo obtener token: {r.get('error_description', '')}")
     return None
 
 
-def upload_to_sharepoint(filepath: str, config, sp_base: str = None) -> bool:
+def upload_to_sharepoint(filepath: str, account: dict = None) -> bool:
+    """
+    Sube 'filepath' a la subcarpeta correcta de SharePoint.
+
+    Parámetros:
+      filepath  — ruta local al archivo descargado
+      account   — dict con al menos 'sp_folder' para determinar la carpeta base;
+                  si es None usa config.SHAREPOINT_BASE_PATH
+    """
     file_path = Path(filepath)
     if not file_path.exists():
         logger.error(f"Archivo no encontrado: {filepath}")
         return False
 
-    token = get_token(config)
+    token = get_token()
     if not token:
-        logger.error("Sin token SharePoint.")
+        logger.error("Sin token SharePoint — no se pudo subir el archivo.")
         return False
 
-    folder = get_folder_for_file(file_path.name, sp_base=sp_base)
-    logger.info(f"Subiendo {file_path.name} → {folder}")
+    base_path = get_base_path(account)
+    folder    = get_folder_for_file(file_path.name, base_path)
+
+    logger.info(f"Subiendo '{file_path.name}' → {folder}")
 
     upload_url = (
-        f"{config.SHAREPOINT_SITE_URL}/_api/web/"
+        f"{_cfg.SHAREPOINT_SITE_URL}/_api/web/"
         f"GetFolderByServerRelativeUrl('{folder}')/"
         f"Files/add(url='{file_path.name}',overwrite=true)"
     )
@@ -101,9 +138,49 @@ def upload_to_sharepoint(filepath: str, config, sp_base: str = None) -> bool:
         if resp.status_code in (200, 201):
             logger.info(f"✓ Subido: {file_path.name}")
             return True
-        else:
-            logger.error(f"HTTP {resp.status_code}: {resp.text[:200]}")
-            return False
-    except Exception as e:
-        logger.error(f"Error: {e}")
+        logger.error(f"HTTP {resp.status_code}: {resp.text[:200]}")
         return False
+    except Exception as e:
+        logger.error(f"upload_to_sharepoint error: {e}")
+        return False
+
+
+# ── CLI — python uploader.py ──────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    import sys
+    from pathlib import Path
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=[logging.StreamHandler(sys.stdout)],
+    )
+
+    output_dir = Path(_cfg.OUTPUT_DIR)
+    if not output_dir.exists():
+        print(f"Carpeta '{output_dir}' no encontrada.")
+        sys.exit(1)
+
+    files = sorted(output_dir.glob("*.xlsx")) + sorted(output_dir.glob("*.csv"))
+    if not files:
+        print(f"No hay archivos .xlsx/.csv en '{output_dir}'.")
+        sys.exit(0)
+
+    print(f"\nArchivos encontrados en '{output_dir}': {len(files)}")
+    for f in files:
+        print(f"  {f.name}")
+
+    confirm = input("\n¿Subir todos a SharePoint? [S/n]: ").strip().lower()
+    if confirm in ("n", "no"):
+        print("Cancelado.")
+        sys.exit(0)
+
+    ok = failed = 0
+    for f in files:
+        if upload_to_sharepoint(str(f)):
+            ok += 1
+        else:
+            failed += 1
+
+    print(f"\nResultado: {ok} subidos, {failed} fallidos.")

@@ -30,9 +30,9 @@ with sync_playwright() as p:
     page.goto(SALES_URL, timeout=40000)
     page.locator('h1:has-text("Sales")').wait_for(timeout=20000)
 
-    print("\n>>> Abrí el modal 'Customize Columns' manualmente en el navegador")
-    print(">>> Cuando el modal esté abierto, presioná ENTER acá\n")
-    input("Presioná ENTER cuando el modal esté abierto...")
+    print("\n>>> AbrÃ­ el modal 'Customize Columns' manualmente en el navegador")
+    print(">>> Cuando el modal estÃ© abierto, presionÃ¡ ENTER acÃ¡\n")
+    input("PresionÃ¡ ENTER cuando el modal estÃ© abierto...")
 
     # Inspeccionar kat-checkboxes con el modal abierto
     result = page.evaluate("""() => {

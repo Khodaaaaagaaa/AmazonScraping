@@ -343,11 +343,12 @@ _JS_FIND_AND_CLICK_DOWNLOAD = """(searchTerm) => {
 }"""
 
 
-def download_from_panel(page: Page, report_name: str, filename: str = None) -> tuple:
+def download_from_panel(page: Page, report_name: str) -> tuple:
     """
     Busca en Manage Downloads el reporte EXACTO por nombre y lo descarga.
     Usa shadow DOM traversal para identificar la fila correcta
     (evita el bug de ancestor::div[4] que capturaba el panel completo).
+    Guarda el archivo con el nombre original sugerido por Amazon Vendor Central.
     Retorna (success: bool, filepath: str | None).
     """
     deadline = time.time() + REPORT_TIMEOUT_SEC
@@ -376,10 +377,9 @@ def download_from_panel(page: Page, report_name: str, filename: str = None) -> t
                 pass
 
             dl = dl_info.value
-            amazon_filename = dl.suggested_filename
-            save_name = filename if filename else amazon_filename
-            filepath = os.path.join(OUTPUT_DIR, save_name)
-            logger.info(f"Nombre Amazon: {amazon_filename} → guardando como: {save_name}")
+            amazon_filename = os.path.basename(dl.suggested_filename)
+            filepath = os.path.join(OUTPUT_DIR, amazon_filename)
+            logger.info(f"Guardando con nombre original de Amazon: {amazon_filename}")
             dl.save_as(filepath)
             logger.info(f"✓ Guardado: {filepath}")
             return True, filepath
@@ -417,14 +417,8 @@ def download_daily_report(page: Page, report_key: str, target_date: date,
     Descarga un reporte diario (Sales, Inventory, Traffic, Net PPM).
     Añade timestamp de descarga al archivo descargado.
     """
-    file_suffix = account.get("file_suffix", "HoneyCanDoHK") if account else "HoneyCanDoHK"
     url = REPORT_URLS[report_key]
     date_tag = f"{target_date.month}-{target_date.day}-{target_date.year}"
-    filename = f"{report_key.upper()}_{target_date.strftime('%Y%m%d')}_{file_suffix}.xlsx"
-
-    if os.path.exists(os.path.join(OUTPUT_DIR, filename)):
-        logger.info(f"Ya existe: {filename}")
-        return True
 
     logger.info(f"\n{'='*50}")
     logger.info(f"Reporte: {report_key.upper()} | Fecha: {target_date}")
@@ -457,7 +451,7 @@ def download_daily_report(page: Page, report_key: str, target_date: date,
     if not click_excel(page):
         return False
 
-    ok, filepath = download_from_panel(page, date_tag, filename)
+    ok, filepath = download_from_panel(page, date_tag)
     if ok and filepath:
         stamp_download_date(filepath)
         upload_file(filepath, account)
@@ -475,11 +469,8 @@ def download_static_report(page: Page, report_key: str,
     en Manage Downloads — proceso idéntico al de Sales.
     """
     from datetime import datetime
-    file_suffix = account.get("file_suffix", "HoneyCanDoHK") if account else "HoneyCanDoHK"
     now = datetime.now()
     today = now.date()
-    today_str = now.strftime("%Y%m%d")
-    filename = f"{report_key.upper()}_{today_str}_{file_suffix}.xlsx"
 
     # Formato con barras: "M/D/YYYY" — es como Amazon muestra "Date Requested" en el panel.
     # Para reportes diarios el date_tag usa guiones porque aparece en el NOMBRE del archivo.
@@ -516,7 +507,7 @@ def download_static_report(page: Page, report_key: str,
     if not click_excel(page):
         return False
 
-    ok, filepath = download_from_panel(page, date_tag, filename)
+    ok, filepath = download_from_panel(page, date_tag)
     if ok and filepath:
         stamp_download_date(filepath)
         upload_file(filepath, account)

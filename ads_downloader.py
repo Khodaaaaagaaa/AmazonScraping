@@ -2,70 +2,43 @@
 ads_downloader.py — Descarga reportes de Sponsored Products (Amazon Advertising)
 
 Flujo:
-  1. Navegar a Amazon Advertising Console
-  2. Ir a Campaign Manager → Reports
-  3. Crear cada tipo de reporte con el rango de fechas
-  4. Esperar hasta que genere (Search Term y Advertised tardan 30-90 min)
-  5. Descargar
-
-NOTA: La consola de Advertising usa la misma sesión Amazon que Vendor Central.
-Si el contexto tiene cookies válidas de amazon.com, debería funcionar.
+  1. Navegar a Amazon Advertising Console → Sponsored ads reports
+  2. FASE 1: Crear los reportes solicitados uno por uno
+  3. FASE 2: Esperar y descargar cada reporte cuando esté listo
 """
 
-import time, logging, os, json
-from datetime import date, datetime
+import time, logging, os, json, re, requests
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from playwright.sync_api import Page, BrowserContext
 
-from config import OUTPUT_DIR, ADS_REPORT_TIMEOUT_SEC, ADS_POLL_INTERVAL_SEC
+from config import OUTPUT_DIR, ADS_REPORT_TIMEOUT_SEC, ADS_POLL_INTERVAL_SEC, SHAREPOINT_ADS_BASE_PATH, ACCOUNT_NAME, HK_ADS_ENTITY_ID
 from downloader import ensure_page, upload_file, setup_output_dir, _GET_ALL_FN
 
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# URLs de entrada (Amazon Advertising Console)
+# Los 12 tipos de reporte
 # ---------------------------------------------------------------------------
-ADS_ENTRY_URLS = [
-    "https://advertising.amazon.com/cm/reports",
-    "https://advertising.amazon.com/",
-]
-
-# Tipos de reporte Sponsored Products y sus timeouts
-# Los lentos (Search Term, Advertised Product) pueden tardar 30-90 min
 ADS_REPORT_TYPES = [
-    {
-        "label":       "Campaign",
-        "file_name":   "campaign",
-        "timeout_sec": 1800,   # 30 min
-    },
-    {
-        "label":       "Ad group",
-        "file_name":   "ad_group",
-        "timeout_sec": 1800,
-    },
-    {
-        "label":       "Targeting",
-        "file_name":   "targeting",
-        "timeout_sec": 3600,   # 60 min
-    },
-    {
-        "label":       "Search term",
-        "file_name":   "search_term",
-        "timeout_sec": ADS_REPORT_TIMEOUT_SEC,  # 120 min por defecto
-    },
-    {
-        "label":       "Advertised product",
-        "file_name":   "advertised_product",
-        "timeout_sec": ADS_REPORT_TIMEOUT_SEC,
-    },
-    {
-        "label":       "Placement",
-        "file_name":   "placement",
-        "timeout_sec": 3600,
-    },
+    {"key": "search_term",            "label": "Search term",                  "mrc": True,  "show_biz": None,  "timeout_sec": ADS_REPORT_TIMEOUT_SEC},
+    {"key": "targeting",              "label": "Targeting",                    "mrc": True,  "show_biz": None,  "timeout_sec": ADS_REPORT_TIMEOUT_SEC},
+    {"key": "advertised_product",     "label": "Advertised product",           "mrc": True,  "show_biz": None,  "timeout_sec": ADS_REPORT_TIMEOUT_SEC},
+    {"key": "campaign",               "label": "Campaign",                     "mrc": True,  "show_biz": None,  "timeout_sec": 1800},
+    {"key": "budget",                 "label": "Budget",                       "mrc": True,  "show_biz": None,  "timeout_sec": 1800},
+    {"key": "placement",              "label": "Placement",                    "mrc": True,  "show_biz": False, "timeout_sec": 1800},
+    {"key": "audience",               "label": "Audience",                     "mrc": False, "show_biz": None,  "timeout_sec": 1800},
+    {"key": "perf_over_time",         "label": "Performance Over Time",        "mrc": True,  "show_biz": None,  "timeout_sec": 1800},
+    {"key": "search_term_imp_share",  "label": "Search Term Impression Share", "mrc": False, "show_biz": None,  "timeout_sec": 1800},
+    {"key": "gross_invalid_traffic",  "label": "Gross and Invalid Traffic",    "mrc": True,  "show_biz": None,  "timeout_sec": 1800},
+    {"key": "prompts",                "label": "Prompts",                      "mrc": False, "show_biz": None,  "timeout_sec": 1800},
+    {"key": "video",                  "label": "Video",                        "mrc": False, "show_biz": None,  "timeout_sec": 1800},
 ]
 
-# JavaScript shadow DOM helper (mismo patrón que downloader.py)
+# ---------------------------------------------------------------------------
+# JavaScript helpers
+# ---------------------------------------------------------------------------
+
 JS_FIND_CLICK = """(searchText, exactMatch) => {
 """ + _GET_ALL_FN + """
     var all = getAll(document);
@@ -85,387 +58,995 @@ JS_FIND_CLICK = """(searchText, exactMatch) => {
     return 'not_found';
 }"""
 
-JS_ADS_CLICK_READY_DOWNLOAD = """() => {
-""" + _GET_ALL_FN + """
-    var all = getAll(document);
-
-    // Estrategia 1: buscar fila con "Complete" / "Ready" y clicar Download en ella
-    var statusWords = ['Complete', 'Ready', 'COMPLETE', 'READY', 'Completed'];
-    var statusEls = all.filter(function(n) {
-        var t = (n.textContent || '').trim();
-        return statusWords.indexOf(t) >= 0;
-    });
-
-    function crossParent(el) {
-        if (el.parentElement) return el.parentElement;
-        var r = el.getRootNode();
-        return (r && r !== document && r.host) ? r.host : null;
-    }
-
-    for (var ri = 0; ri < statusEls.length; ri++) {
-        var ancestor = crossParent(statusEls[ri]);
-        for (var up = 0; up < 10 && ancestor; up++) {
-            var sub = getAll(ancestor);
-            for (var si = 0; si < sub.length; si++) {
-                var node = sub[si];
-                var txt = (node.textContent || '').trim();
-                if (txt !== 'Download' && txt !== 'download') continue;
-                var tag = node.tagName.toLowerCase();
-                if (['a', 'button', 'span'].indexOf(tag) >= 0) {
-                    node.click();
-                    return 'clicked_from_status';
-                }
+# Obtiene los meses visibles en el calendar picker (ej: [{month:4, year:2026}, {month:5, year:2026}])
+JS_GET_CALENDAR_MONTHS = """() => {
+    var MONTHS_RE = /^(January|February|March|April|May|June|July|August|September|October|November|December)\\s+(\\d{4})/;
+    var MONTH_NAMES = ["January","February","March","April","May","June",
+                       "July","August","September","October","November","December"];
+    var result = [];
+    var seen = {};
+    var candidates = document.querySelectorAll('button, span, div, h4, h3, [role="heading"]');
+    for (var i = 0; i < candidates.length; i++) {
+        var el = candidates[i];
+        var txt = (el.textContent || '').trim();
+        if (txt.length < 8 || txt.length > 25) continue;
+        var m = txt.match(MONTHS_RE);
+        if (m && el.childElementCount < 3) {
+            var key = m[1] + '-' + m[2];
+            if (!seen[key]) {
+                seen[key] = true;
+                result.push({month: MONTH_NAMES.indexOf(m[1]) + 1, year: parseInt(m[2])});
             }
-            ancestor = crossParent(ancestor);
+        }
+    }
+    return JSON.stringify(result);
+}"""
+
+# Hace click en un día del calendario por aria-label o por número de día dentro del mes correcto
+JS_CLICK_CALENDAR_DAY = """(targetDay, targetMonth, targetYear) => {
+    var MONTH_NAMES = ["January","February","March","April","May","June",
+                       "July","August","September","October","November","December"];
+    var monthName = MONTH_NAMES[targetMonth - 1];
+    var dayStr = String(targetDay);
+
+    // Intento 1: aria-label que incluya el mes, día y año
+    var all = document.querySelectorAll('button, td, [role="gridcell"], [role="button"]');
+    for (var i = 0; i < all.length; i++) {
+        var el = all[i];
+        var aria = (el.getAttribute('aria-label') || '');
+        if (aria.includes(monthName) && aria.includes(dayStr) && aria.includes(String(targetYear))) {
+            if (!el.disabled && el.getAttribute('aria-disabled') !== 'true') {
+                el.click();
+                return 'clicked_aria:' + aria;
+            }
         }
     }
 
-    // Estrategia 2: cualquier botón/link exacto "Download"
-    for (var ai = 0; ai < all.length; ai++) {
-        var node2 = all[ai];
-        var txt2 = (node2.textContent || '').trim();
-        if (txt2 !== 'Download') continue;
-        var tag2 = node2.tagName.toLowerCase();
-        if (['a', 'button'].indexOf(tag2) >= 0) {
-            node2.click();
-            return 'clicked_direct';
+    // Intento 2: celda con texto exacto del día, dentro de un padre que menciona el mes/año
+    var cells = document.querySelectorAll('td, [role="gridcell"], button');
+    for (var i = 0; i < cells.length; i++) {
+        var cell = cells[i];
+        var txt = (cell.textContent || '').trim();
+        if (txt !== dayStr) continue;
+        if (cell.disabled || cell.getAttribute('aria-disabled') === 'true') continue;
+
+        var parent = cell.parentElement;
+        for (var depth = 0; depth < 12 && parent; depth++) {
+            var pTxt = (parent.textContent || '').substring(0, 300);
+            if (pTxt.includes(monthName) && pTxt.includes(String(targetYear))) {
+                cell.click();
+                return 'clicked_cell:' + monthName + ' ' + dayStr + ' ' + targetYear;
+            }
+            parent = parent.parentElement;
+        }
+    }
+    return 'not_found:' + monthName + ' ' + dayStr + ' ' + targetYear;
+}"""
+
+# Encuentra y hace click en el botón de descarga (ícono ↓) de la fila correcta.
+# Estrategia 1: match EXACTO en columna "Report type" (evita confundir
+#   "Search term" con "Search Term Impression Share").
+# Estrategia 2: match por nombre del reporte "Sponsored Products X report".
+# Solo hace click si la fila tiene fecha en "Last run" (reporte completado).
+JS_ADS_CLICK_DOWNLOAD_BY_TYPE = """(reportTypeLabel) => {
+    var labelLower = reportTypeLabel.toLowerCase();
+    var reportName = "sponsored products " + labelLower + " report";
+    var matchingRows = [];
+
+    // Estrategia 1: columna "Report type" — match EXACTO
+    var allCells = document.querySelectorAll('td, [role="cell"]');
+    for (var ci = 0; ci < allCells.length; ci++) {
+        var cell = allCells[ci];
+        var ct = (cell.textContent || '').trim().toLowerCase();
+        if (ct === labelLower && ct.length >= 3) {
+            var rowEl = cell.closest('tr, [role="row"]');
+            if (rowEl && matchingRows.indexOf(rowEl) === -1) matchingRows.push(rowEl);
         }
     }
 
-    var inProc = all.filter(function(n) {
-        var t = (n.textContent || '').trim();
-        return t === 'In progress' || t === 'In Progress' || t === 'Processing' || t === 'Pending';
-    }).length;
-    return JSON.stringify({not_ready: true, in_progress: inProc, ready: statusEls.length});
+    // Estrategia 2: link con el nombre exacto del reporte
+    if (matchingRows.length === 0) {
+        var links = document.querySelectorAll('a, [role="link"]');
+        for (var li = 0; li < links.length; li++) {
+            var lt = (links[li].textContent || '').trim().toLowerCase();
+            if (lt === reportName) {
+                var rowEl = links[li].closest('tr, [role="row"]');
+                if (rowEl && matchingRows.indexOf(rowEl) === -1) matchingRows.push(rowEl);
+            }
+        }
+    }
+
+    if (matchingRows.length === 0) {
+        return JSON.stringify({status:'no_rows', label:reportTypeLabel});
+    }
+
+    // Para cada fila candidata: debe tener fecha en "Last run" (reporte completado)
+    for (var ri = 0; ri < matchingRows.length; ri++) {
+        var row    = matchingRows[ri];
+        var rowTxt = (row.textContent || '');
+
+        var hasDate = /\\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\\b/.test(rowTxt);
+        if (!hasDate) continue;
+
+        // ── Estrategia 1: enlace cuyo href contiene "download-report" ───────
+        var dlBtn = row.querySelector('a[href*="download-report"]');
+        if (dlBtn) {
+            dlBtn.click();
+            return JSON.stringify({status:'clicked', label:reportTypeLabel, via:'href-download-report', href:(dlBtn.href||'').substring(0,80)});
+        }
+
+        // ── Estrategia 2: ícono storm-ui con data-testid → subir al <a> padre ─
+        var dlIcon = row.querySelector('i[data-testid="storm-ui-icon-download"]');
+        if (dlIcon) {
+            var parent = dlIcon.parentElement;
+            for (var depth = 0; depth < 5 && parent && parent !== row; depth++) {
+                if (parent.tagName.toLowerCase() === 'a') {
+                    parent.click();
+                    return JSON.stringify({status:'clicked', label:reportTypeLabel, via:'storm-ui-icon-parent-a'});
+                }
+                parent = parent.parentElement;
+            }
+            dlIcon.click();
+            return JSON.stringify({status:'clicked', label:reportTypeLabel, via:'storm-ui-icon-direct'});
+        }
+
+        // ── Estrategia 3: cualquier <a> o botón con "download" en href/aria ──
+        var interactive = row.querySelectorAll('a, button, [role="button"]');
+        for (var ii = 0; ii < interactive.length; ii++) {
+            var el   = interactive[ii];
+            var href = (el.getAttribute('href')        || '').toLowerCase();
+            var aria = (el.getAttribute('aria-label') || '').toLowerCase();
+            var title= (el.getAttribute('title')       || '').toLowerCase();
+            if (href.includes('download') || href.includes('amazonaws.com') ||
+                aria.includes('download') || title.includes('download')) {
+                el.click();
+                return JSON.stringify({status:'clicked', label:reportTypeLabel, via:'attr-fallback', href:href.substring(0,80)});
+            }
+        }
+    }
+
+    // Contar pendientes para diagnóstico
+    var pending = 0;
+    document.querySelectorAll('*').forEach(function(n) {
+        var t = (n.textContent || '').trim().toLowerCase();
+        if (t.length < 30 && (t === 'in progress' || t === 'processing' || t === 'pending' || t === 'running')) pending++;
+    });
+    return JSON.stringify({status:'no_download', label:reportTypeLabel, rows_found:matchingRows.length, pending:pending});
 }"""
 
 
 # ---------------------------------------------------------------------------
-# Navegación a la consola de Advertising
+# Helpers
 # ---------------------------------------------------------------------------
 
-def navigate_to_ads_reports(page: Page) -> bool:
+_hk_entity_id: str = HK_ADS_ENTITY_ID  # entityId de HK Limited (ENTITY2BTHXP5BCM35L)
+
+
+def _get_entity_id(page: Page) -> str:
+    m = re.search(r'entityId=([A-Z0-9]+)', page.url)
+    return m.group(1) if m else None
+
+
+def _switch_ads_account(page: Page, account_name: str) -> bool:
     """
-    Navega a la sección de reportes en Amazon Advertising Console.
-    Retorna True si llegó a alguna página de reportes.
+    Selecciona la cuenta indicada en Amazon Advertising Console.
+
+    Pasos:
+      1. Verificar si ya estamos en la cuenta correcta — si sí, retornar.
+      2. Clickear el selector de cuenta en el header (sin importar qué cuenta esté activa).
+      3. Esperar 2 s a que se despliegue el menú.
+      4. Clickear el elemento con texto exacto de la cuenta destino.
+      5. Confirmar que la página muestra la cuenta correcta.
     """
-    for url in ADS_ENTRY_URLS:
-        try:
-            logger.info(f"Intentando: {url}")
-            page.goto(url, timeout=30000)
-            page.wait_for_load_state("domcontentloaded", timeout=20000)
-            time.sleep(3)
+    logger.info(f"Verificando cuenta → {account_name}")
 
-            cur = page.url.lower()
-            # Si redirigió a sign-in, abortar este URL
-            if "signin" in cur or "ap/signin" in cur or "login" in cur:
-                logger.warning(f"Redirigió a login: {cur}")
-                continue
-
-            logger.info(f"URL actual: {page.url}")
-
-            # Buscar y clicar "Reports" en la navegación si no estamos ya ahí
-            if "reports" not in cur:
-                for report_label in ["Reports", "Report center", "Reporting"]:
-                    try:
-                        result = page.evaluate(JS_FIND_CLICK, [report_label, True])
-                        if "clicked" in result:
-                            logger.info(f"✓ Cliqueado: {result}")
-                            time.sleep(2)
-                            break
-                    except Exception:
-                        pass
-
-            return True
-        except Exception as e:
-            logger.warning(f"navigate_to_ads_reports ({url}): {e}")
-
-    logger.error("No se pudo acceder a Amazon Advertising Console")
-    return False
-
-
-def select_ads_account(page: Page, account_name: str) -> bool:
-    """
-    Si hay múltiples perfiles de advertising, selecciona el correcto.
-    """
+    # ── Paso 0: ¿Ya estamos en la cuenta correcta? ────────────────────────────
     try:
+        if account_name in page.inner_text('body'):
+            logger.info(f"✓ Ya en la cuenta correcta: {account_name}")
+            return True
+    except Exception:
+        pass
+
+    page.screenshot(path="debug_ads_before_switch.png")
+    logger.info("Cambiando de cuenta...")
+
+    # ── Paso 1: click en el selector de cuenta del header ────────────────────
+    # Estrategia A: buscar un botón/div en el header con texto de cuenta corto (< 60 chars)
+    clicked_trigger = False
+    try:
+        result = page.evaluate("""() => {
+            // Buscar en header/nav el elemento con texto de cuenta (no menú, no nav links)
+            var zones = document.querySelectorAll('header, nav, [class*="header"], [class*="Header"], [class*="topbar"], [class*="Topbar"], [class*="navbar"], [class*="Navbar"]');
+            var candidates = [];
+            zones.forEach(function(zone) {
+                var els = zone.querySelectorAll('button, a, div, span, [role="button"], [role="combobox"]');
+                els.forEach(function(el) {
+                    if (!el.offsetParent) return;
+                    var t = el.textContent.trim();
+                    // Texto que parece un nombre de cuenta: entre 3 y 60 chars, no es un link de nav
+                    if (t.length >= 3 && t.length <= 60 && !t.includes('\\n')) {
+                        candidates.push(el);
+                    }
+                });
+            });
+            if (candidates.length === 0) return 'no_candidates';
+            // Preferir el más específico (texto más corto) que no sea un link de navegación conocido
+            candidates.sort(function(a, b) { return a.textContent.trim().length - b.textContent.trim().length; });
+            for (var i = 0; i < candidates.length; i++) {
+                var el = candidates[i];
+                var t = el.textContent.trim().toLowerCase();
+                var skip = ['reports','campaigns','portfolio','billing','settings','help','home','dashboard'];
+                if (skip.some(function(s){ return t === s; })) continue;
+                el.click();
+                return 'clicked:' + el.tagName + ':' + el.textContent.trim().substring(0, 60);
+            }
+            return 'no_match';
+        }""")
+        if "clicked" in result:
+            clicked_trigger = True
+            logger.info(f"✓ Click selector de cuenta: {result}")
+    except Exception as e:
+        logger.debug(f"trigger JS zona: {e}")
+
+    # Estrategia B: cualquier elemento visible con texto que coincida con nombre de cuenta
+    if not clicked_trigger:
+        try:
+            result = page.evaluate("""(target) => {
+                var all = document.querySelectorAll('button, a, div, span, li');
+                var exact = [], partial = [];
+                for (var i = 0; i < all.length; i++) {
+                    var el = all[i];
+                    if (!el.offsetParent) continue;
+                    var t = el.textContent.trim();
+                    if (t.length > 0 && t.length <= 80) {
+                        if (t === target) exact.push(el);
+                        else if (t.indexOf('Can Do') >= 0 || t.indexOf('Brands') >= 0) partial.push(el);
+                    }
+                }
+                var pool = exact.length > 0 ? exact : partial;
+                if (pool.length === 0) return 'not_found';
+                pool.sort(function(a,b){ return a.textContent.trim().length - b.textContent.trim().length; });
+                pool[0].click();
+                return 'clicked:' + pool[0].tagName + ':' + pool[0].textContent.trim().substring(0,60);
+            }""", account_name)
+            if "clicked" in result:
+                clicked_trigger = True
+                logger.info(f"✓ Click selector B: {result}")
+        except Exception as e:
+            logger.debug(f"trigger B: {e}")
+
+    if not clicked_trigger:
+        logger.warning("No se encontró el selector de cuenta en el header")
+        page.screenshot(path="debug_ads_account_menu.png")
+        return False
+
+    # ── Paso 2: esperar a que se despliegue el menú ───────────────────────────
+    time.sleep(4)  # darle más tiempo al dropdown de cargar
+
+    # Screenshot del estado del dropdown para diagnóstico
+    page.screenshot(path="debug_ads_dropdown_open.png")
+
+    # ── Paso 3: click en la cuenta destino dentro del dropdown ────────────────
+    clicked_account = False
+
+    # Intentar Playwright: exact=False para tolerar variaciones menores de nombre
+    try:
+        option = page.locator('[role="listbox"], [role="menu"], ul, [role="option"], li').get_by_text(
+            account_name, exact=False
+        ).first
+        if option.is_visible(timeout=3000):
+            option.click()
+            clicked_account = True
+            logger.info(f"✓ Cuenta seleccionada (locator): {account_name}")
+    except Exception as e:
+        logger.debug(f"option locator: {e}")
+
+    # Fallback JS: matching flexible — busca "HK" + "Honey" en cualquier elemento visible
+    if not clicked_account:
+        try:
+            result = page.evaluate("""(target) => {
+                // Palabras clave del nombre de cuenta — basta con que contenga todas
+                var keywords = ['HK', 'Honey'];
+                function matchesAccount(txt) {
+                    var t = txt.trim();
+                    return keywords.every(function(k){ return t.indexOf(k) >= 0; });
+                }
+
+                // Paso 1: buscar en menús/dropdowns desplegados
+                var zones = document.querySelectorAll(
+                    '[role="listbox"], [role="menu"], [role="list"], ' +
+                    '[aria-expanded="true"], [class*="dropdown"], [class*="Dropdown"], ' +
+                    '[class*="menu"], [class*="Menu"], [class*="popover"], [class*="Popover"]'
+                );
+                for (var zi = 0; zi < zones.length; zi++) {
+                    var items = zones[zi].querySelectorAll('li, [role="option"], a, button, div, span');
+                    for (var ii = 0; ii < items.length; ii++) {
+                        var el = items[ii];
+                        if (!el.offsetParent) continue;
+                        var t = el.textContent.trim();
+                        if (t.length > 0 && t.length < 100 && matchesAccount(t)) {
+                            el.click();
+                            return 'clicked_zone:' + el.tagName + ':' + t;
+                        }
+                    }
+                }
+
+                // Paso 2: búsqueda global en todo el DOM
+                var all = document.querySelectorAll('a, button, li, div, span, option');
+                for (var i = 0; i < all.length; i++) {
+                    var el = all[i];
+                    if (!el.offsetParent) continue;
+                    var t = el.textContent.trim();
+                    if (t.length > 0 && t.length < 100 && matchesAccount(t)) {
+                        el.click();
+                        return 'clicked_global:' + el.tagName + ':' + t;
+                    }
+                }
+
+                // Diagnóstico: listar todos los elementos visibles que contengan "HK"
+                var found = [];
+                document.querySelectorAll('*').forEach(function(el) {
+                    if (!el.offsetParent) return;
+                    var t = el.textContent.trim();
+                    if (t.indexOf('HK') >= 0 && t.length < 80) found.push(t.substring(0,60));
+                });
+                return 'not_found:hk_visible=' + JSON.stringify(found.slice(0,10));
+            }""", account_name)
+            if "clicked" in result:
+                clicked_account = True
+                logger.info(f"✓ Cuenta JS: {result}")
+        except Exception as e:
+            logger.debug(f"account JS: {e}")
+
+    if not clicked_account:
+        logger.warning(f"No se encontró '{account_name}' en el menú desplegado")
+        page.screenshot(path="debug_ads_account_menu.png")
+        return False
+
+    # ── Paso 4: esperar confirmación de la cuenta ─────────────────────────────
+    try:
+        page.wait_for_function(
+            f"() => document.body.innerText.includes('{account_name}')",
+            timeout=15000
+        )
+        logger.info(f"✓ Cuenta confirmada en página: {account_name}")
         time.sleep(2)
-        # Intentar encontrar el nombre de la cuenta en un selector de perfil
-        result = page.evaluate(JS_FIND_CLICK, [account_name, False])
-        if "clicked" in result:
-            logger.info(f"✓ Cuenta ADS seleccionada: {result}")
-            time.sleep(3)
-            return True
-        logger.info(f"Selector de cuenta ADS: {result}")
+        return True
     except Exception as e:
-        logger.warning(f"select_ads_account: {e}")
-    return True  # Continuar aunque no se encontró (puede que ya esté seleccionada)
+        logger.warning(f"Timeout esperando confirmación de cuenta: {e}")
+        # Verificar si está en la página de todas formas
+        try:
+            if account_name in page.inner_text('body'):
+                logger.info(f"✓ Cuenta presente en página (post-timeout): {account_name}")
+                return True
+        except Exception:
+            pass
+        return False
 
 
-# ---------------------------------------------------------------------------
-# Crear un reporte en la consola
-# ---------------------------------------------------------------------------
-
-def create_ads_report(page: Page, report_type: str,
-                       start: date, end: date) -> bool:
+def fill_ads_date_range(page: Page, start: date, end: date) -> bool:
     """
-    Crea un reporte de Sponsored Products del tipo dado.
-    Retorna True si el reporte fue solicitado.
+    Selecciona el rango de fechas en el calendar picker de Amazon Ads.
+    Intenta usar un preset si aplica; si no, navega el calendario manualmente.
     """
-    start_str = start.strftime("%m/%d/%Y")
-    end_str   = end.strftime("%m/%d/%Y")
+    today       = date.today()
+    month_start = date(today.year, today.month, 1)
+    prev_end    = month_start - timedelta(days=1)
+    prev_start  = date(prev_end.year, prev_end.month, 1)
 
-    logger.info(f"Creando reporte ADS: {report_type} ({start_str} → {end_str})")
+    # Determinar preset
+    preset = None
+    if start == today and end == today:
+        preset = "Today"
+    elif start == month_start and end == today:
+        preset = "Month to date"
+    elif start == prev_start and end == prev_end:
+        preset = "Last month"
+    elif end == today and (today - start).days == 6:
+        preset = "Last 7 days"
+    elif end == today and (today - start).days == 29:
+        preset = "Last 30 days"
+
+    # Abrir el date picker
+    try:
+        period_btn = page.locator('button').filter(
+            has_text=re.compile(r'Last \d+ days|Month to date|Last month|Today|Yesterday|Last week|Last 7 days', re.I)
+        ).first
+        if period_btn.count() == 0:
+            # Buscar cualquier botón con icono de calendario o texto de fecha
+            period_btn = page.locator('[class*="DateRange"], [class*="date-range"], [class*="period"]').first
+        if period_btn.count() == 0:
+            logger.warning("fill_ads_date_range: botón de período no encontrado")
+            return False
+        period_btn.click()
+        time.sleep(1)
+    except Exception as e:
+        logger.warning(f"fill_ads_date_range open: {e}")
+        return False
+
+    # Intentar preset
+    if preset:
+        try:
+            preset_el = page.locator('li, button, [role="option"]').filter(has_text=preset).first
+            if preset_el.count() > 0 and preset_el.is_visible():
+                preset_el.click()
+                time.sleep(0.5)
+                save_btn = page.locator('button:has-text("Save")').first
+                if save_btn.count() > 0 and save_btn.is_visible():
+                    save_btn.click()
+                    time.sleep(1)
+                logger.info(f"✓ Fecha preset: {preset}")
+                return True
+        except Exception as e:
+            logger.debug(f"Preset '{preset}': {e}")
+
+    # Navegación manual del calendario
+    def get_displayed_months():
+        try:
+            raw  = page.evaluate(JS_GET_CALENDAR_MONTHS)
+            data = json.loads(raw)
+            return [(d['month'], d['year']) for d in data]
+        except Exception:
+            return []
+
+    def nav_prev():
+        try:
+            btn = page.locator('button').filter(has_text=re.compile(r'^[<‹◀]$|previous', re.I)).first
+            if btn.count() == 0:
+                btn = page.get_by_role("button", name=re.compile("previous|prev", re.I)).first
+            btn.click()
+            time.sleep(0.4)
+        except Exception as e:
+            logger.debug(f"nav_prev: {e}")
+
+    def nav_next():
+        try:
+            btn = page.locator('button').filter(has_text=re.compile(r'^[>›▶]$|next', re.I)).first
+            if btn.count() == 0:
+                btn = page.get_by_role("button", name=re.compile("^next$|forward", re.I)).first
+            btn.click()
+            time.sleep(0.4)
+        except Exception as e:
+            logger.debug(f"nav_next: {e}")
+
+    def ensure_month_visible(yr: int, mo: int) -> bool:
+        target = date(yr, mo, 1)
+        for _ in range(24):
+            displayed = get_displayed_months()
+            if not displayed:
+                return False
+            dates = [date(y, m, 1) for m, y in displayed]
+            if target in dates:
+                return True
+            if target < min(dates):
+                nav_prev()
+            else:
+                nav_next()
+        return False
+
+    def click_calendar_date(target: date) -> bool:
+        try:
+            result = page.evaluate(JS_CLICK_CALENDAR_DAY, [target.day, target.month, target.year])
+            logger.info(f"Calendar click {target}: {result}")
+            return "clicked" in result
+        except Exception as e:
+            logger.warning(f"click_calendar_date {target}: {e}")
+            return False
+
+    ensure_month_visible(start.year, start.month)
+    click_calendar_date(start)
+    time.sleep(0.5)
+
+    if (end.year, end.month) != (start.year, start.month):
+        ensure_month_visible(end.year, end.month)
+    click_calendar_date(end)
+    time.sleep(0.5)
 
     try:
-        # Clicar "Create report" o "+" o "Run report"
-        created = False
-        for label in ["Create report", "Create Report", "New report", "Run report", "+ Create"]:
-            result = page.evaluate(JS_FIND_CLICK, [label, False])
-            if "clicked" in result:
-                logger.info(f"✓ Create: {result}")
-                time.sleep(2)
-                created = True
-                break
-
-        if not created:
-            logger.warning("No se encontró botón 'Create report'")
-            page.screenshot(path=f"debug_ads_create_{report_type}.png")
-            return False
-
-        # Seleccionar "Sponsored Products" si aparece el selector de tipo de campaña
-        time.sleep(1)
-        for sp_label in ["Sponsored Products", "Sponsored products"]:
-            result = page.evaluate(JS_FIND_CLICK, [sp_label, True])
-            if "clicked" in result:
-                logger.info(f"✓ Sponsored Products: {result}")
-                time.sleep(1)
-                break
-
-        # Seleccionar el tipo de reporte
-        time.sleep(1)
-        result = page.evaluate(JS_FIND_CLICK, [report_type, True])
-        if "clicked" in result:
-            logger.info(f"✓ Tipo: {result}")
-        else:
-            # Intento parcial
-            result = page.evaluate(JS_FIND_CLICK, [report_type, False])
-            logger.info(f"Tipo parcial: {result}")
-        time.sleep(1)
-
-        # Configurar rango de fechas
-        # Intentar seleccionar "Custom" o similar
-        for date_range_label in ["Custom date range", "Custom", "Date range"]:
-            result = page.evaluate(JS_FIND_CLICK, [date_range_label, False])
-            if "clicked" in result:
-                logger.info(f"✓ Date range: {result}")
-                time.sleep(1)
-                break
-
-        # Llenar fechas de inicio y fin
-        try:
-            date_inputs = page.locator('input[type="text"]:visible, input[type="date"]:visible').all()
-            filled = 0
-            for inp in date_inputs:
-                if filled >= 2:
-                    break
-                try:
-                    ph = (inp.get_attribute("placeholder") or "").lower()
-                    val = inp.input_value() or ""
-                    # Primera fecha visible = inicio, segunda = fin
-                    target = start_str if filled == 0 else end_str
-                    inp.click(click_count=3)
-                    time.sleep(0.2)
-                    inp.fill(target)
-                    time.sleep(0.2)
-                    inp.press("Tab")
-                    time.sleep(0.3)
-                    logger.info(f"Fecha {filled+1}: {target}")
-                    filled += 1
-                except Exception as e:
-                    logger.debug(f"Date input {filled}: {e}")
-        except Exception as e:
-            logger.warning(f"Fechas ADS: {e}")
-
-        # Clicar "Run" / "Create" / "Submit"
-        time.sleep(1)
-        submitted = False
-        for submit_label in ["Run", "Create", "Submit", "Run report", "Create report"]:
-            try:
-                btn = page.locator(f'button:has-text("{submit_label}")').first
-                if btn.count() > 0 and btn.is_visible() and btn.is_enabled():
-                    btn.click()
-                    logger.info(f"✓ Submit: {submit_label}")
-                    time.sleep(3)
-                    submitted = True
-                    break
-            except Exception:
-                pass
-
-        if not submitted:
-            logger.warning("No se encontró botón Submit para el reporte ADS")
-            page.screenshot(path=f"debug_ads_submit_{report_type}.png")
-            return False
-
-        logger.info(f"✓ Reporte {report_type} solicitado.")
-        return True
-
+        save_btn = page.locator('button:has-text("Save")').first
+        if save_btn.count() > 0 and save_btn.is_visible():
+            save_btn.click()
+            time.sleep(1)
+            logger.info(f"✓ Fechas: {start} → {end}")
+            return True
+        logger.warning("Save button no encontrado después de seleccionar fechas")
+        page.screenshot(path="debug_ads_calendar.png")
+        return False
     except Exception as e:
-        logger.error(f"create_ads_report ({report_type}): {e}")
-        page.screenshot(path=f"debug_ads_error_{report_type}.png")
+        logger.warning(f"Date save: {e}")
         return False
 
 
 # ---------------------------------------------------------------------------
-# Esperar y descargar un reporte ADS
+# Navegación
+# ---------------------------------------------------------------------------
+
+def navigate_to_ads_reports(page: Page) -> bool:
+    """
+    Navega a Sponsored ads reports de la cuenta Honey Can Do HK Limited.
+    Si ya se cacheó el entityId de HK Limited, usa la URL directa (más rápido para polling).
+    Si no: Paso 1 (base URL + switch de cuenta) → Paso 2 (click menú) → Paso 3 (fallback URL).
+    """
+    global _hk_entity_id
+
+    # ── Atajo: URL directa con entityId cacheado ─────────────────────────────
+    if _hk_entity_id:
+        try:
+            direct = f"https://advertising.amazon.com/reports?entityId={_hk_entity_id}"
+            logger.info(f"ADS directo (entityId cacheado): {direct}")
+            page.goto(direct, timeout=30000)
+            page.wait_for_load_state("domcontentloaded", timeout=20000)
+            time.sleep(2)
+            cur = page.url.lower()
+            if any(k in cur for k in ["signin", "login"]):
+                logger.warning("Sesión expirada con entityId cacheado — reiniciando navegación completa.")
+                _hk_entity_id = None  # Limpiar cache y reintentar con flujo completo
+            else:
+                logger.info(f"✓ ADS Reports (directo): {page.url}")
+                return True
+        except Exception as e:
+            logger.warning(f"Atajo entityId falló: {e} — usando flujo completo.")
+            _hk_entity_id = None
+
+    # ── Flujo completo ─────────────────────────────────────────────────────────
+
+    # Paso 1: base URL
+    try:
+        logger.info("ADS paso 1: cargando advertising.amazon.com...")
+        page.goto("https://advertising.amazon.com", timeout=30000)
+        page.wait_for_load_state("domcontentloaded", timeout=20000)
+        time.sleep(4)
+
+        cur = page.url.lower()
+        if any(k in cur for k in ["signin", "ap/signin", "login"]):
+            logger.error(f"Sesión inválida. URL: {cur}")
+            return False
+        logger.info(f"✓ Base: {page.url}")
+
+        # Verificar cuenta — debe ser Honey Can Do HK Limited
+        try:
+            body_txt = page.inner_text('body')
+            if ACCOUNT_NAME not in body_txt:
+                logger.info(f"Cuenta incorrecta. Cambiando a: {ACCOUNT_NAME}")
+                _switch_ads_account(page, ACCOUNT_NAME)
+                time.sleep(2)
+        except Exception as e:
+            logger.debug(f"Verificación de cuenta: {e}")
+
+    except Exception as e:
+        logger.warning(f"ADS paso 1: {e}")
+        return False
+
+    # Paso 2: click "Sponsored ads reports" en el menú lateral
+    if "reports" not in page.url.lower():
+        logger.info("ADS paso 2: buscando menú 'Sponsored ads reports'...")
+        for lbl in ["Sponsored ads reports", "Sponsored Products reports", "Reports"]:
+            try:
+                result = page.evaluate(JS_FIND_CLICK, [lbl, True])
+                if "clicked" in result:
+                    logger.info(f"✓ Menú: {result}")
+                    time.sleep(3)
+                    break
+            except Exception as e:
+                logger.debug(f"click '{lbl}': {e}")
+
+    # Paso 3: fallback a URL directa genérica
+    if "reports" not in page.url.lower():
+        logger.info("ADS paso 3: fallback URL directa...")
+        try:
+            page.goto("https://advertising.amazon.com/reports", timeout=30000)
+            page.wait_for_load_state("domcontentloaded", timeout=20000)
+            time.sleep(3)
+        except Exception as e:
+            logger.error(f"ADS paso 3: {e}")
+            return False
+
+    cur = page.url.lower()
+    if any(k in cur for k in ["signin", "login"]):
+        logger.error("ADS: sesión inválida post-navegación.")
+        return False
+
+    # Cachear entityId de HK Limited para navegaciones futuras más rápidas
+    eid = _get_entity_id(page)
+    if eid:
+        try:
+            if ACCOUNT_NAME in page.inner_text('body'):
+                _hk_entity_id = eid
+                logger.info(f"✓ EntityId HK Limited cacheado: {_hk_entity_id}")
+        except Exception:
+            pass
+
+    logger.info(f"✓ ADS Reports: {page.url}")
+    return True
+
+
+def select_ads_account(page: Page, account_name: str) -> bool:
+    try:
+        time.sleep(2)
+        result = page.evaluate(JS_FIND_CLICK, [account_name, False])
+        if "clicked" in result:
+            logger.info(f"✓ Cuenta: {result}")
+            time.sleep(3)
+    except Exception as e:
+        logger.warning(f"select_ads_account: {e}")
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Crear un reporte (FASE 1)
+# ---------------------------------------------------------------------------
+
+def create_ads_report(page: Page, report_cfg: dict, start: date, end: date) -> bool:
+    label    = report_cfg["label"]
+    mrc      = report_cfg["mrc"]
+    show_biz = report_cfg["show_biz"]
+
+    logger.info(f"Creando reporte ADS: {label} ({start} → {end})")
+
+    try:
+        # Navegar directamente al formulario de nuevo reporte
+        entity_id = _get_entity_id(page)
+        new_url = (
+            f"https://advertising.amazon.com/reports/new?entityId={entity_id}"
+            if entity_id else "https://advertising.amazon.com/reports/new"
+        )
+        page.goto(new_url, timeout=30000)
+        page.wait_for_load_state("domcontentloaded", timeout=20000)
+        time.sleep(3)
+
+        if "reports" not in page.url.lower():
+            logger.error(f"Formulario no cargó. URL: {page.url}")
+            page.screenshot(path=f"debug_ads_form_{label.replace(' ', '_')}.png")
+            return False
+
+        page.screenshot(path=f"debug_ads_form_{label.replace(' ', '_')}.png")
+        logger.info(f"Formulario: {page.url}")
+
+        # ── MRC checkbox ──────────────────────────────────────────────────────
+        if mrc:
+            try:
+                checkboxes = page.locator('input[type="checkbox"]').all()
+                for cb in checkboxes:
+                    parent_txt = cb.evaluate("el => (el.closest('label') || el.parentElement || {}).textContent || ''")
+                    if "MRC" in parent_txt or "Media Rating" in parent_txt:
+                        if not cb.is_checked():
+                            cb.click()
+                            logger.info("✓ MRC activado")
+                            time.sleep(0.5)
+                        break
+            except Exception as e:
+                logger.debug(f"MRC: {e}")
+
+        # ── Report type dropdown ──────────────────────────────────────────────
+        if label != "Search term":
+            try:
+                time.sleep(0.5)
+                # Abrir el dropdown (muestra "Search term" por defecto)
+                opened = False
+
+                # Intentar como native <select>
+                sel = page.locator('select').filter(has_text=re.compile('search term|targeting|campaign', re.I)).first
+                if sel.count() > 0:
+                    sel.select_option(label=label)
+                    logger.info(f"✓ Report type (select): {label}")
+                    opened = True
+                else:
+                    # Custom dropdown: click el trigger actual
+                    default_types = ["Search term", "Targeting", "Campaign", "Budget",
+                                     "Placement", "Audience", "Video", "Prompts"]
+                    for dt in default_types:
+                        trigger = page.locator('button, [role="combobox"]').filter(has_text=dt).first
+                        if trigger.count() > 0 and trigger.is_visible():
+                            trigger.click()
+                            time.sleep(0.8)
+                            opened = True
+                            break
+
+                    if opened:
+                        # Click la opción deseada
+                        option = page.locator('[role="option"], li, option').filter(has_text=label).first
+                        if option.count() > 0:
+                            option.click()
+                            logger.info(f"✓ Report type (dropdown): {label}")
+                        else:
+                            result = page.evaluate(JS_FIND_CLICK, [label, True])
+                            logger.info(f"Report type JS: {result}")
+                        time.sleep(0.5)
+                    else:
+                        result = page.evaluate(JS_FIND_CLICK, [label, True])
+                        logger.info(f"Report type JS fallback: {result}")
+                        time.sleep(0.5)
+
+            except Exception as e:
+                logger.warning(f"Report type: {e}")
+
+        # ── Amazon Business — OFF para Placement ─────────────────────────────
+        if show_biz is False:
+            try:
+                checkboxes = page.locator('input[type="checkbox"]').all()
+                for cb in checkboxes:
+                    pt = cb.evaluate("el => (el.closest('label') || el.parentElement || {}).textContent || ''")
+                    if "Amazon Business" in pt or "business" in pt.lower():
+                        if cb.is_checked():
+                            cb.click()
+                            logger.info("✓ Amazon Business OFF")
+                            time.sleep(0.5)
+                        break
+            except Exception as e:
+                logger.debug(f"Biz checkbox: {e}")
+
+        # ── Currency conversion — OFF ─────────────────────────────────────────
+        try:
+            checkboxes = page.locator('input[type="checkbox"]').all()
+            for cb in checkboxes:
+                pt = cb.evaluate("el => (el.closest('label') || el.parentElement || {}).textContent || ''")
+                if "currency" in pt.lower() or "converted" in pt.lower():
+                    if cb.is_checked():
+                        cb.click()
+                        logger.info("✓ Currency OFF")
+                        time.sleep(0.5)
+                    break
+        except Exception as e:
+            logger.debug(f"Currency: {e}")
+
+        # ── Time unit: Daily ──────────────────────────────────────────────────
+        try:
+            daily_label = page.locator('label').filter(has_text=re.compile(r'^Daily$')).first
+            if daily_label.count() > 0:
+                daily_label.click()
+                logger.info("✓ Time unit: Daily")
+                time.sleep(0.5)
+            else:
+                result = page.evaluate(JS_FIND_CLICK, ["Daily", True])
+                logger.info(f"Daily JS: {result}")
+                time.sleep(0.5)
+        except Exception as e:
+            logger.debug(f"Daily: {e}")
+
+        # ── Date range ────────────────────────────────────────────────────────
+        fill_ads_date_range(page, start, end)
+
+        # ── Run report ────────────────────────────────────────────────────────
+        time.sleep(1)
+        submitted = False
+        try:
+            run_btn = page.locator('button:has-text("Run report")').first
+            if run_btn.count() > 0 and run_btn.is_visible():
+                run_btn.click()
+                logger.info(f"✓ Run report: {label}")
+                time.sleep(4)
+                submitted = True
+        except Exception as e:
+            logger.debug(f"Run report locator: {e}")
+
+        if not submitted:
+            for btn_txt in ["Run report", "Run", "Create"]:
+                result = page.evaluate(JS_FIND_CLICK, [btn_txt, True])
+                if "clicked" in result:
+                    logger.info(f"✓ Submit JS: {result}")
+                    time.sleep(4)
+                    submitted = True
+                    break
+
+        if not submitted:
+            logger.warning(f"No se encontró botón Submit para {label}")
+            page.screenshot(path=f"debug_ads_submit_{label.replace(' ', '_')}.png")
+            return False
+
+        logger.info(f"✓ Reporte '{label}' solicitado.")
+        return True
+
+    except Exception as e:
+        logger.error(f"create_ads_report ({label}): {e}")
+        page.screenshot(path=f"debug_ads_error_{label.replace(' ', '_')}.png")
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Esperar y descargar un reporte (FASE 2)
 # ---------------------------------------------------------------------------
 
 def wait_and_download_ads_report(page: Page, context: BrowserContext,
-                                  report_type: str, filename: str,
+                                  report_cfg: dict, filename: str,
                                   account: dict = None,
                                   timeout_sec: int = None) -> tuple:
-    """
-    Espera hasta que el reporte esté listo y lo descarga.
-    Navega a la lista de reportes en cada ciclo para refrescar.
-    Retorna (success, page).
-    """
-    filepath = os.path.join(OUTPUT_DIR, filename)
-    timeout_sec = timeout_sec or ADS_REPORT_TIMEOUT_SEC
-    deadline = time.time() + timeout_sec
-    attempt = 0
+    label       = report_cfg["label"]
+    timeout_sec = timeout_sec or report_cfg.get("timeout_sec", ADS_REPORT_TIMEOUT_SEC)
+    deadline    = time.time() + timeout_sec
+    attempt     = 0
 
-    logger.info(f"Esperando reporte ADS '{report_type}' (timeout: {timeout_sec//60} min)...")
+    logger.info(f"Esperando '{label}' (timeout: {timeout_sec // 60} min)...")
 
     while time.time() < deadline:
         attempt += 1
         remaining = int(deadline - time.time())
-        logger.info(f"[ADS Intento {attempt}] '{report_type}' — quedan {remaining//60} min {remaining%60}s")
+        logger.info(f"[ADS {attempt}] '{label}' — quedan {remaining // 60}m {remaining % 60}s")
 
         page = ensure_page(context, page)
 
-        # Navegar a la lista de reportes para refrescar estado
         try:
             navigate_to_ads_reports(page)
             time.sleep(2)
         except Exception as e:
-            logger.warning(f"navigate_ads_reports: {e}")
+            logger.warning(f"navigate: {e}")
             time.sleep(ADS_POLL_INTERVAL_SEC)
             continue
 
-        # Intentar descargar
         try:
-            with page.expect_download(timeout=8000) as dl_info:
-                result = page.evaluate(JS_ADS_CLICK_READY_DOWNLOAD)
+            # ── 1. Encontrar la fila del reporte ──────────────────────────────────────
+            # La tabla usa ag-grid que virtualiza columnas — la col "Last run" con la fecha
+            # puede no estar en el DOM. En cambio, el <a href*="download-report"> solo
+            # aparece en col-id="reportName" cuando el reporte ya tiene su download UUID.
+            row = None
+            for sel in [
+                f"[role='row']:has-text('Sponsored Products {label} report')",
+                f"[role='row']:has-text('{label}')",
+                f"tr:has-text('{label}')",
+            ]:
+                try:
+                    candidate = page.locator(sel).first
+                    if candidate.count() > 0:
+                        row = candidate
+                        break
+                except Exception:
+                    pass
 
-            if result and "clicked" in str(result):
-                dl = dl_info.value
-                amazon_name = dl.suggested_filename
-                logger.info(f"✓ ADS Descargado: {amazon_name}")
-                dl.save_as(filepath)
-                logger.info(f"✓ Guardado: {filepath}")
-                upload_file(filepath, account)
+            if row is None or row.count() == 0:
+                logger.info(f"'{label}' — fila no encontrada en la tabla.")
+                raise Exception("pending")
+
+            # ── 2. Buscar el enlace de descarga en la fila ────────────────────────────
+            # Su presencia es la señal real de que el reporte está listo.
+            href = None
+            for link_sel in [
+                'a[href*="download-report"]',
+                'a[href*="amazonaws.com"]',
+                'a[download]',
+            ]:
+                try:
+                    link = row.locator(link_sel).first
+                    if link.count() > 0:
+                        href = link.get_attribute('href')
+                        if href:
+                            logger.info(f"'{label}' — enlace encontrado ({link_sel}): {href[:80]}")
+                            break
+                except Exception:
+                    pass
+
+            if not href:
+                logger.info(f"'{label}' — enlace de descarga no disponible aún (reporte en cola).")
+                raise Exception("pending")
+
+            # ── 3. Hacer absoluta si es relativa ─────────────────────────────────────
+            if href.startswith('/'):
+                href = 'https://advertising.amazon.com' + href
+
+            logger.info(f"'{label}' — descargando vía HTTP: {href[:100]}...")
+
+            # ── 4. Descargar con cookies de la sesión actual del browser ─────────────
+            cookies = page.context.cookies()
+            session_cookies = {c['name']: c['value'] for c in cookies}
+            resp_headers = {
+                'User-Agent': ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                               'AppleWebKit/537.36 (KHTML, like Gecko) '
+                               'Chrome/120.0.0.0 Safari/537.36'),
+                'Referer': page.url,
+            }
+            response = requests.get(href, cookies=session_cookies,
+                                    headers=resp_headers, timeout=60)
+
+            if response.status_code == 200:
+                save_path = os.path.join(OUTPUT_DIR, filename)
+                with open(save_path, 'wb') as f:
+                    f.write(response.content)
+                logger.info(f"✓ Descargado: {filename} ({len(response.content):,} bytes)")
+                upload_file(save_path, account)
                 return True, page
             else:
-                logger.info(f"Estado ADS: {result}")
+                logger.warning(f"HTTP {response.status_code} al descargar '{label}'")
+                raise Exception(f"HTTP {response.status_code}")
 
         except Exception as e:
             err_str = str(e).lower()
-            if "timeout" in err_str or "waiting" in err_str:
-                logger.info(f"Reporte ADS no listo aún")
+            if "pending" in err_str:
+                logger.info(f"'{label}' aún no disponible.")
+            elif "http" in err_str:
+                logger.warning(f"'{label}' error de descarga: {e}")
             else:
-                logger.warning(f"wait_and_download_ads_report: {e}")
+                logger.warning(f"wait_download '{label}': {e}")
 
         wait = min(ADS_POLL_INTERVAL_SEC, max(30, int(deadline - time.time())))
-        logger.info(f"Próximo chequeo en {wait//60}m {wait%60}s...")
+        logger.info(f"Próximo chequeo: {wait // 60}m {wait % 60}s...")
         time.sleep(wait)
 
-    logger.error(f"Timeout ADS ({timeout_sec//60} min) para '{filename}'")
+    logger.error(f"Timeout ADS ({timeout_sec // 60} min) para '{label}'")
     return False, page
 
 
 # ---------------------------------------------------------------------------
-# Orquestador principal — ADS
+# Orquestador principal
 # ---------------------------------------------------------------------------
 
 def download_all_ads_reports(page: Page, context: BrowserContext,
                                start: date, end: date,
-                               account: dict = None) -> Page:
+                               account: dict = None,
+                               reports_to_run=None) -> Page:
     """
-    Descarga todos los reportes de Sponsored Products para una cuenta.
-    Retorna la página activa al finalizar.
+    Descarga los reportes de Sponsored Products.
+    reports_to_run: "all" o lista de keys, ej: ["campaign", "targeting"]
     """
     setup_output_dir()
 
-    if account is None:
-        from config import ACCOUNTS
-        account = ACCOUNTS[0]
+    file_suffix  = (account or {}).get("file_suffix", "HoneyCanDoHK")
+    run_all      = (reports_to_run is None or reports_to_run == "all")
+    selected     = set() if run_all else set(reports_to_run)
+    active_types = [r for r in ADS_REPORT_TYPES if (run_all or r["key"] in selected)]
 
-    file_suffix = account.get("file_suffix", "HoneyCanDoHK")
-    today_str   = datetime.now().strftime("%Y%m%d")
+    if not active_types:
+        logger.warning("Ningún reporte ADS seleccionado.")
+        return page
 
-    logger.info(f"\n{'█'*50}")
-    logger.info(f"ADS REPORTS — {account['name']} | {start} → {end}")
-    logger.info("█"*50)
+    account_name = (account or {}).get("name", "Honey Can Do HK Limited")
+    ads_account  = dict(account or {})
+    ads_account.setdefault("name", account_name)
+    ads_account.setdefault("file_suffix", file_suffix)
+    ads_account["sp_folder"] = SHAREPOINT_ADS_BASE_PATH
+
+    logger.info(f"\n{'█' * 50}")
+    logger.info(f"ADS REPORTS — {account_name} | {start} → {end}")
+    logger.info(f"Reportes: {[r['label'] for r in active_types]}")
+    logger.info("█" * 50)
 
     page = ensure_page(context, page)
 
-    # Navegar a la consola de advertising
     if not navigate_to_ads_reports(page):
-        logger.error("No se pudo acceder a Amazon Advertising. Saltando ADS reports.")
+        logger.error("No se pudo acceder a Amazon Advertising.")
         return page
 
-    # Seleccionar la cuenta correcta si hay múltiples perfiles
-    select_ads_account(page, account["name"])
+    select_ads_account(page, account_name)
 
-    total = 0
-
-    # Fase 1: Solicitar todos los reportes primero
+    # ── FASE 1: Solicitar todos los reportes ──────────────────────────────────
     logger.info("\n--- FASE 1: Solicitando reportes ---")
     requested = []
-    for rpt in ADS_REPORT_TYPES:
-        filename = f"ADS_{rpt['file_name'].upper()}_{start.strftime('%Y%m%d')}_{end.strftime('%Y%m%d')}_{file_suffix}.csv"
-        filepath = os.path.join(OUTPUT_DIR, filename)
-
-        if os.path.exists(filepath):
+    for rpt in active_types:
+        label_clean = rpt['label'].replace(' ', '_')
+        filename = f"Honey_Sponsored_Products_{label_clean}_report_{start.strftime('%Y%m')}.csv"
+        if os.path.exists(os.path.join(OUTPUT_DIR, filename)):
             logger.info(f"Ya existe: {filename}")
             continue
 
-        # Navegar a reports antes de crear cada uno
         navigate_to_ads_reports(page)
         time.sleep(2)
 
-        ok = create_ads_report(page, rpt["label"], start, end)
+        ok = create_ads_report(page, rpt, start, end)
         if ok:
             requested.append(rpt)
             logger.info(f"✓ Solicitado: {rpt['label']}")
         else:
-            logger.warning(f"✗ No se pudo solicitar: {rpt['label']}")
-
+            logger.warning(f"✗ Fallo al solicitar: {rpt['label']}")
         time.sleep(3)
 
     if not requested:
-        logger.warning("No se solicitó ningún reporte ADS")
+        logger.warning("No se solicitó ningún reporte ADS nuevo.")
         return page
 
-    logger.info(f"\nSolicitados: {len(requested)} reportes. Esperando generación...")
+    logger.info(f"\nSolicitados: {len(requested)}. Iniciando espera...")
 
-    # Fase 2: Esperar y descargar cada reporte
-    # Los reportes lentos (search_term, advertised_product) se esperan más
+    # ── FASE 2: Descargar ─────────────────────────────────────────────────────
     logger.info("\n--- FASE 2: Descargando reportes ---")
+    total = 0
     for rpt in requested:
-        filename = f"ADS_{rpt['file_name'].upper()}_{start.strftime('%Y%m%d')}_{end.strftime('%Y%m%d')}_{file_suffix}.csv"
-
-        logger.info(f"\n{'='*50}")
-        logger.info(f"Esperando: {rpt['label']} (timeout: {rpt['timeout_sec']//60} min)")
+        label_clean = rpt['label'].replace(' ', '_')
+        filename = f"Honey_Sponsored_Products_{label_clean}_report_{start.strftime('%Y%m')}.csv"
+        logger.info(f"\n{'=' * 50}")
+        logger.info(f"Esperando: {rpt['label']} (timeout: {rpt['timeout_sec'] // 60} min)")
 
         ok, page = wait_and_download_ads_report(
-            page, context,
-            rpt["label"], filename,
-            account=account,
-            timeout_sec=rpt["timeout_sec"],
+            page, context, rpt, filename, account=ads_account
         )
         if ok:
             total += 1
 
-    logger.info(f"\n{'█'*50}\n✓ ADS completo. Descargados: {total}/{len(requested)}")
+    logger.info(f"\n{'█' * 50}\n✓ ADS completo. Descargados: {total}/{len(requested)}")
     return page

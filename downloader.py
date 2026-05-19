@@ -343,12 +343,11 @@ _JS_FIND_AND_CLICK_DOWNLOAD = """(searchTerm) => {
 }"""
 
 
-def download_from_panel(page: Page, report_name: str) -> tuple:
+def download_from_panel(page: Page, report_name: str, filename: str = None) -> tuple:
     """
     Busca en Manage Downloads el reporte EXACTO por nombre y lo descarga.
     Usa shadow DOM traversal para identificar la fila correcta
     (evita el bug de ancestor::div[4] que capturaba el panel completo).
-    Guarda el archivo con el nombre original sugerido por Amazon Vendor Central.
     Retorna (success: bool, filepath: str | None).
     """
     deadline = time.time() + REPORT_TIMEOUT_SEC
@@ -377,9 +376,10 @@ def download_from_panel(page: Page, report_name: str) -> tuple:
                 pass
 
             dl = dl_info.value
-            amazon_filename = os.path.basename(dl.suggested_filename)
-            filepath = os.path.join(OUTPUT_DIR, amazon_filename)
-            logger.info(f"Guardando con nombre original de Amazon: {amazon_filename}")
+            amazon_filename = dl.suggested_filename
+            save_name = filename if filename else amazon_filename
+            filepath = os.path.join(OUTPUT_DIR, save_name)
+            logger.info(f"Nombre Amazon: {amazon_filename} → guardando como: {save_name}")
             dl.save_as(filepath)
             logger.info(f"✓ Guardado: {filepath}")
             return True, filepath
@@ -415,10 +415,16 @@ def download_daily_report(page: Page, report_key: str, target_date: date,
                            account: dict = None) -> bool:
     """
     Descarga un reporte diario (Sales, Inventory, Traffic, Net PPM).
-    Añade timestamp de descarga al archivo descargado.
+    Usa el nombre original de Amazon (ej: Sales_ASIN_Sourcing_Retail_UnitedStates_Daily_1-1-2026_1-1-2026.xlsx).
     """
-    url = REPORT_URLS[report_key]
+    url      = REPORT_URLS[report_key]
     date_tag = f"{target_date.month}-{target_date.day}-{target_date.year}"
+
+    # Chequeo "ya existe" buscando cualquier archivo con ese rango de fechas en OUTPUT_DIR
+    existing = list(Path(OUTPUT_DIR).glob(f"*_{date_tag}_{date_tag}.*"))
+    if existing:
+        logger.info(f"Ya existe: {existing[0].name}")
+        return True
 
     logger.info(f"\n{'='*50}")
     logger.info(f"Reporte: {report_key.upper()} | Fecha: {target_date}")
@@ -451,6 +457,7 @@ def download_daily_report(page: Page, report_key: str, target_date: date,
     if not click_excel(page):
         return False
 
+    # filename=None → download_from_panel usa dl.suggested_filename (nombre real de Amazon)
     ok, filepath = download_from_panel(page, date_tag)
     if ok and filepath:
         stamp_download_date(filepath)
@@ -463,19 +470,11 @@ def download_static_report(page: Page, report_key: str,
                             account: dict = None) -> bool:
     """
     Descarga un reporte sin fecha (Real Time Sales, Forecasting, DF Forecast, Catalog).
-    Añade timestamp de descarga al archivo — crítico para estos reportes
-    ya que Amazon no incluye fecha en el nombre del archivo.
-    Usa date_tag de hoy (mismo formato que Sales) para identificar la fila exacta
-    en Manage Downloads — proceso idéntico al de Sales.
+    Usa el nombre original de Amazon para el archivo.
     """
     from datetime import datetime
-    now = datetime.now()
-    today = now.date()
-
-    # Formato con barras: "M/D/YYYY" — es como Amazon muestra "Date Requested" en el panel.
-    # Para reportes diarios el date_tag usa guiones porque aparece en el NOMBRE del archivo.
-    # Para reportes estáticos no hay fecha en el nombre, solo en "Date Requested" (barras).
-    date_tag = f"{today.month}/{today.day}/{today.year}"
+    today    = datetime.now().date()
+    date_tag = f"{today.month}/{today.day}/{today.year}"   # "M/D/YYYY" — como Amazon lo muestra en panel
 
     logger.info(f"\n{'='*50}")
     logger.info(f"Reporte estático: {report_key.upper()} | Buscando en panel: '{date_tag}'")
@@ -507,6 +506,7 @@ def download_static_report(page: Page, report_key: str,
     if not click_excel(page):
         return False
 
+    # filename=None → download_from_panel usa dl.suggested_filename (nombre real de Amazon)
     ok, filepath = download_from_panel(page, date_tag)
     if ok and filepath:
         stamp_download_date(filepath)

@@ -39,8 +39,8 @@ RELATIVE_FOLDERS = {
     "TRAFFIC":         "03 Traffic",           # Amazon: Traffic_ASIN_...
     "CATALOG":         "06 Catalog",           # Amazon: Catalog_ASIN_...
 
-    # ── Ads (Sponsored Products) — base path: SHAREPOINT_ADS_BASE_PATH ────────
-    # Nombres nuevos: Honey_Sponsored_Products_<Type>_report_YYYYMM.csv
+    # ── Ads (Sponsored Products) — base path: sp_ads_folder de la cuenta ───────
+    # Honey Can Do HK Limited: Honey_Sponsored_Products_<Type>_report_YYYYMM.csv
     # Más específicos primero para evitar matches parciales.
     "HONEY_SPONSORED_PRODUCTS_SEARCH_TERM_IMPRESSION": "08 SP Search Term Impression",
     "HONEY_SPONSORED_PRODUCTS_SEARCH_TERM":            "00 SP Search Term",
@@ -54,6 +54,19 @@ RELATIVE_FOLDERS = {
     "HONEY_SPONSORED_PRODUCTS_GROSS":                  "09 SP Gross and Invalid Traffic",
     "HONEY_SPONSORED_PRODUCTS_PROMPTS":                "10 SP Prompts",
     "HONEY_SPONSORED_PRODUCTS_VIDEO":                  "11 SP Video",
+    # Can Do Brands: CanDo_Sponsored_Products_<Type>_report_YYYYMM.csv
+    "CANDO_SPONSORED_PRODUCTS_SEARCH_TERM_IMPRESSION": "08 SP Search Term Impression",
+    "CANDO_SPONSORED_PRODUCTS_SEARCH_TERM":            "00 SP Search Term",
+    "CANDO_SPONSORED_PRODUCTS_TARGETING":              "01 SP Targeting",
+    "CANDO_SPONSORED_PRODUCTS_ADVERTISED":             "02 SP Advertised",
+    "CANDO_SPONSORED_PRODUCTS_CAMPAIGN":               "03 SP Campaign",
+    "CANDO_SPONSORED_PRODUCTS_BUDGET":                 "04 SP Budget",
+    "CANDO_SPONSORED_PRODUCTS_PLACEMENT":              "05 SP Placement",
+    "CANDO_SPONSORED_PRODUCTS_AUDIENCE":               "06 SP Audience",
+    "CANDO_SPONSORED_PRODUCTS_PERFORMANCE":            "07 SP Perfomance Over Time",
+    "CANDO_SPONSORED_PRODUCTS_GROSS":                  "09 SP Gross and Invalid Traffic",
+    "CANDO_SPONSORED_PRODUCTS_PROMPTS":                "10 SP Prompts",
+    "CANDO_SPONSORED_PRODUCTS_VIDEO":                  "11 SP Video",
     # Nombres legacy ADS_ (compatibilidad hacia atrás)
     "ADS_SEARCH_TERM_IMP_SHARE":  "08 SP Search Term Impression",
     "ADS_SEARCH_TERM":            "00 SP Search Term",
@@ -70,22 +83,25 @@ RELATIVE_FOLDERS = {
 }
 
 # Prefijos que corresponden a reportes ADS (para carpeta de año y base path)
-_ADS_PREFIXES = {k for k in RELATIVE_FOLDERS if k.startswith(("ADS_", "HONEY_SPONSORED_PRODUCTS_"))}
+_ADS_PREFIXES = {k for k in RELATIVE_FOLDERS if k.startswith(("ADS_", "HONEY_SPONSORED_PRODUCTS_", "CANDO_SPONSORED_PRODUCTS_"))}
 
 
 def get_base_path(filename: str = None, account: dict = None) -> str:
     """
-    Prioridad:
-    1. account["sp_folder"] si está definido.
-    2. Nombre de archivo empieza con "ADS_" → usar SHAREPOINT_ADS_BASE_PATH.
-    3. Fallback: SHAREPOINT_BASE_PATH (retail).
+    Determina la carpeta base en SharePoint según tipo de archivo y cuenta.
+    ADS (Sponsored Products) → account["sp_ads_folder"] o SHAREPOINT_ADS_BASE_PATH.
+    Retail                   → account["sp_folder"]     o SHAREPOINT_BASE_PATH.
     """
-    if account and account.get("sp_folder"):
-        return account["sp_folder"]
     if filename:
         name_up = Path(filename).name.upper()
-        if name_up.startswith(("ADS_", "HONEY_SPONSORED_PRODUCTS_")):
+        is_ads  = name_up.startswith(("ADS_", "HONEY_SPONSORED_PRODUCTS_", "CANDO_SPONSORED_PRODUCTS_"))
+        if is_ads:
+            if account and account.get("sp_ads_folder"):
+                return account["sp_ads_folder"]
             return _cfg.SHAREPOINT_ADS_BASE_PATH
+    # Retail
+    if account and account.get("sp_folder"):
+        return account["sp_folder"]
     return _cfg.SHAREPOINT_BASE_PATH
 
 
@@ -139,20 +155,35 @@ def _ensure_folder(folder_path: str, token: str) -> bool:
     return True
 
 
-def get_folder_for_file(filename: str, base_path: str) -> str:
+def get_folder_for_file(filename: str, base_path: str, account: dict = None) -> str:
     """
     Determina la subcarpeta de destino a partir del nombre del archivo.
-    Para archivos ADS añade subcarpeta de año: base/subfolder/YYYY.
+    - ADS: siempre añade subcarpeta de año (base/subfolder/YYYY).
+    - Retail: añade subcarpeta de año solo si account["retail_year_subfolder"] es True.
     """
-    name_upper = Path(filename).name.upper()
+    name_upper       = Path(filename).name.upper()
+    retail_year_sub  = (account or {}).get("retail_year_subfolder", False)
+
     for prefix, subfolder in RELATIVE_FOLDERS.items():
         if name_upper.startswith(prefix):
             folder = f"{base_path}/{subfolder}"
             if prefix in _ADS_PREFIXES:
-                # Extraer año: nuevo formato _YYYYMM., viejo formato _YYYYMMDD_
+                # ADS: año desde _YYYYMM.
                 m = re.search(r'_(\d{4})\d{2}[._]', name_upper)
                 if m:
                     folder = f"{folder}/{m.group(1)}"
+            elif retail_year_sub:
+                # Retail con año: extraer desde formato Amazon _D-D-YYYY_
+                m = re.search(r'_\d+-\d+-(\d{4})[_.]', name_upper)
+                if not m:
+                    m = re.search(r'_(\d{4})\d{2}[._]', name_upper)   # fallback
+                if m:
+                    folder = f"{folder}/{m.group(1)}"
+            # Real Time Sales: subcarpeta por horas (24H, 48H, etc.)
+            if subfolder == "01 Real Time Sales":
+                m = re.search(r'TRAILING(\d+)HOURS', name_upper)
+                if m:
+                    folder = f"{folder}/{m.group(1)}H"
             return folder
     logger.warning(f"Sin carpeta específica para '{filename}'; usando '00 Sales' como fallback.")
     return f"{base_path}/00 Sales"
@@ -217,7 +248,7 @@ def upload_to_sharepoint(filepath: str, account: dict = None) -> bool:
         return False
 
     base_path = get_base_path(file_path.name, account)
-    folder    = get_folder_for_file(file_path.name, base_path)
+    folder    = get_folder_for_file(file_path.name, base_path, account)
 
     logger.info(f"Subiendo '{file_path.name}' → {folder}")
     _ensure_folder(folder, token)

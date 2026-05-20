@@ -88,6 +88,11 @@ ACCOUNTS = [
     },
 ]
 
+# ─── SCHEDULER ───────────────────────────────────────────────────────────────
+# Horas UTC en las que corre el scraper automáticamente (formato "HH:MM").
+# Para correr a las 6am UTC (= 2am ET / 1am CT):
+SCHEDULE_TIMES = ["06:00"]
+
 # ─── COMPATIBILIDAD HACIA ATRÁS ───────────────────────────────────────────────
 ACCOUNT_NAME     = ACCOUNTS[0]["name"]
 HK_ADS_ENTITY_ID = ACCOUNTS[0]["ads_entity_id"]

@@ -1,0 +1,18 @@
+[Unit]
+Description=Amazon Vendor Central Scraper
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/amazon-scraping
+ExecStart=/home/ubuntu/amazon-scraping/venv/bin/python scheduler.py
+Restart=always
+RestartSec=60
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=amazon-scraper
+
+[Install]
+WantedBy=multi-user.target

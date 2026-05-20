@@ -25,6 +25,170 @@ REPORT_URLS = {
     "catalog":      f"{BASE}/product-catalog",
 }
 
+
+def _make_retail_url(report_key: str, account: dict = None) -> str:
+    """Devuelve la URL del reporte, añadiendo entityId si la cuenta lo tiene configurado."""
+    url = REPORT_URLS[report_key]
+    entity_id = (account or {}).get("retail_entity_id")
+    if entity_id:
+        sep = "&" if "?" in url else "?"
+        return f"{url}{sep}entityId={entity_id}"
+    return url
+
+
+_JS_GET_ALL = """function getAll(root) {
+    var nodes = [];
+    try {
+        var tw = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
+        var n; while (n = tw.nextNode()) {
+            nodes.push(n);
+            if (n.shadowRoot) nodes = nodes.concat(getAll(n.shadowRoot));
+        }
+    } catch(e) {}
+    return nodes;
+}"""
+
+
+def _read_current_vc_account(page) -> str:
+    """Lee el nombre de cuenta activo en el header de Vendor Central."""
+    try:
+        return page.evaluate(f"""() => {{
+            {_JS_GET_ALL}
+            var all = getAll(document);
+            var best = '', bestLen = 9999;
+            for (var i = 0; i < all.length; i++) {{
+                var t = (all[i].textContent || '').trim();
+                if (t.startsWith('US - ') && t.length < 100 && t.length < bestLen) {{
+                    best = t; bestLen = t.length;
+                }}
+            }}
+            return best;
+        }}""")
+    except Exception:
+        return ""
+
+
+def switch_vendor_central_account(page: Page, account: dict) -> bool:
+    """
+    Cambia a la cuenta indicada en Vendor Central vía el switcher del header.
+    Paso 1: click en el header (y < 80) para abrir la lista de cuentas.
+    Paso 2: click en la cuenta destino en la lista (y > 60, matching flexible).
+    """
+    header_name = (account or {}).get("vc_header_name", "")
+    if not header_name:
+        return True
+    account_short = header_name.replace("US - ", "")
+
+    # ── Verificar cuenta actual ───────────────────────────────────────────────
+    current = _read_current_vc_account(page)
+    if current == header_name:
+        logger.info(f"✓ Vendor Central ya en cuenta: {header_name}")
+        return True
+    if current:
+        logger.info(f"Cuenta actual: '{current}' → cambiando a '{header_name}'")
+
+    # ── Paso 1: click en el botón del header ─────────────────────────────────
+    # Preferir el elemento con la y MÁS ALTA (más específico/hoja del DOM),
+    # y entre iguales preferir SPAN/BUTTON/A sobre DIV — evita clickear
+    # el contenedor padre en lugar del botón real.
+    click_text = current if current else header_name
+    result_step1 = page.evaluate(f"""([txt]) => {{
+        {_JS_GET_ALL}
+        var all = getAll(document);
+        var best = null, bestTop = -1, bestPri = 0;
+        var TAG_PRI = {{SPAN:3, BUTTON:3, A:3, DIV:1}};
+        var log = [];
+        for (var i = 0; i < all.length; i++) {{
+            var t = (all[i].textContent || '').trim();
+            if (t === txt) {{
+                var r = all[i].getBoundingClientRect();
+                log.push(r.top.toFixed(0) + '[' + all[i].tagName + ']');
+                if (r.top >= 0 && r.top < 80 && r.height > 0) {{
+                    var pri = TAG_PRI[all[i].tagName] || 1;
+                    if (r.top > bestTop || (r.top === bestTop && pri > bestPri)) {{
+                        bestTop = r.top; bestPri = pri; best = all[i];
+                    }}
+                }}
+            }}
+        }}
+        if (best) {{
+            best.click();
+            return 'clicked y=' + bestTop.toFixed(0) + ' [' + best.tagName + ']';
+        }}
+        return 'not_found|' + log.slice(0,8).join(';');
+    }}""", [click_text])
+    logger.info(f"Paso1 click header: {result_step1}")
+
+    if result_step1.startswith("not_found"):
+        logger.warning("No se encontró el botón de cuenta en el header.")
+        page.screenshot(path="debug_vc_no_trigger.png")
+        return False
+
+    # Esperar a que el SPA cargue la lista de cuentas (NO usar networkidle — tarda 40s)
+    time.sleep(4)
+    page.screenshot(path="debug_vc_switch_accounts.png")
+
+    # ── Paso 2: seleccionar la cuenta destino ─────────────────────────────────
+    for attempt in range(12):
+        # Intento A: Playwright get_by_text (auto-espera, pierces shadow DOM)
+        for name_try in [header_name, account_short]:
+            try:
+                page.get_by_text(name_try, exact=True).first.click(timeout=2000)
+                logger.info(f"✓ Cuenta seleccionada via get_by_text('{name_try}')")
+                try:
+                    page.wait_for_load_state("networkidle", timeout=30000)
+                except Exception:
+                    time.sleep(6)
+                new_account = _read_current_vc_account(page)
+                logger.info(f"Cuenta tras switch: '{new_account}'")
+                return True
+            except Exception:
+                pass
+
+        # Intento B: JS getBoundingClientRect (fallback shadow DOM profundo)
+        # y > 60 evita re-clickear el header (double-click cierra el panel)
+        result_step2 = page.evaluate(f"""([full, short]) => {{
+            {_JS_GET_ALL}
+            var all = getAll(document);
+            for (var i = 0; i < all.length; i++) {{
+                var t = (all[i].textContent || '').replace(/\\s+/g, ' ').trim();
+                if ((t === full || t === short || t.includes(full) ||
+                     (t.startsWith(short) && t.length < 120)) && t.length < 200) {{
+                    var r = all[i].getBoundingClientRect();
+                    if (r.top > 60 && r.height > 0) {{
+                        all[i].click();
+                        return 'js_clicked:' + t.substring(0,60) + ' y=' + r.top.toFixed(0) + ' [' + all[i].tagName + ']';
+                    }}
+                }}
+            }}
+            var cands = [];
+            for (var i = 0; i < all.length; i++) {{
+                var t = (all[i].textContent || '').replace(/\\s+/g, ' ').trim();
+                if ((t.includes('Can Do') || t.includes('Honey') || t.includes('US - ')) && t.length < 120) {{
+                    var r = all[i].getBoundingClientRect();
+                    cands.push('"' + t.substring(0,35) + '" y=' + r.top.toFixed(0) + '[' + all[i].tagName + ']');
+                }}
+            }}
+            return 'not_found|' + cands.slice(0,10).join(' | ');
+        }}""", [header_name, account_short])
+
+        if not result_step2.startswith("not_found"):
+            logger.info(f"✓ Cuenta seleccionada: {result_step2}")
+            try:
+                page.wait_for_load_state("networkidle", timeout=30000)
+            except Exception:
+                time.sleep(6)
+            new_account = _read_current_vc_account(page)
+            logger.info(f"Cuenta tras switch: '{new_account}'")
+            return True
+
+        logger.info(f"Intento {attempt + 1}/12: {result_step2}")
+        time.sleep(2)
+
+    logger.warning(f"No se pudo seleccionar '{header_name}' después de 12 intentos.")
+    page.screenshot(path="debug_vc_option_not_found.png")
+    return False
+
 REPORT_H1_TEXT = {
     "sales":     "Sales",
     "inventory": "Inventory",
@@ -343,13 +507,16 @@ _JS_FIND_AND_CLICK_DOWNLOAD = """(searchTerm) => {
 }"""
 
 
-def download_from_panel(page: Page, report_name: str, filename: str = None) -> tuple:
+def download_from_panel(page: Page, report_name: str, filename: str = None,
+                        output_dir: str = None) -> tuple:
     """
     Busca en Manage Downloads el reporte EXACTO por nombre y lo descarga.
     Usa shadow DOM traversal para identificar la fila correcta
     (evita el bug de ancestor::div[4] que capturaba el panel completo).
     Retorna (success: bool, filepath: str | None).
     """
+    output_dir = output_dir or OUTPUT_DIR
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
     deadline = time.time() + REPORT_TIMEOUT_SEC
     logger.info(f"Esperando reporte '{report_name}' en Manage Downloads...")
 
@@ -378,7 +545,7 @@ def download_from_panel(page: Page, report_name: str, filename: str = None) -> t
             dl = dl_info.value
             amazon_filename = dl.suggested_filename
             save_name = filename if filename else amazon_filename
-            filepath = os.path.join(OUTPUT_DIR, save_name)
+            filepath = os.path.join(output_dir, save_name)
             logger.info(f"Nombre Amazon: {amazon_filename} → guardando como: {save_name}")
             dl.save_as(filepath)
             logger.info(f"✓ Guardado: {filepath}")
@@ -417,11 +584,11 @@ def download_daily_report(page: Page, report_key: str, target_date: date,
     Descarga un reporte diario (Sales, Inventory, Traffic, Net PPM).
     Usa el nombre original de Amazon (ej: Sales_ASIN_Sourcing_Retail_UnitedStates_Daily_1-1-2026_1-1-2026.xlsx).
     """
-    url      = REPORT_URLS[report_key]
-    date_tag = f"{target_date.month}-{target_date.day}-{target_date.year}"
+    url        = _make_retail_url(report_key, account)
+    date_tag   = f"{target_date.month}-{target_date.day}-{target_date.year}"
+    output_dir = (account or {}).get("output_dir", OUTPUT_DIR)
 
-    # Chequeo "ya existe" buscando cualquier archivo con ese rango de fechas en OUTPUT_DIR
-    existing = list(Path(OUTPUT_DIR).glob(f"*_{date_tag}_{date_tag}.*"))
+    existing = list(Path(output_dir).glob(f"*_{date_tag}_{date_tag}.*"))
     if existing:
         logger.info(f"Ya existe: {existing[0].name}")
         return True
@@ -457,8 +624,7 @@ def download_daily_report(page: Page, report_key: str, target_date: date,
     if not click_excel(page):
         return False
 
-    # filename=None → download_from_panel usa dl.suggested_filename (nombre real de Amazon)
-    ok, filepath = download_from_panel(page, date_tag)
+    ok, filepath = download_from_panel(page, date_tag, output_dir=output_dir)
     if ok and filepath:
         stamp_download_date(filepath)
         upload_file(filepath, account)
@@ -479,7 +645,7 @@ def download_static_report(page: Page, report_key: str,
     logger.info(f"\n{'='*50}")
     logger.info(f"Reporte estático: {report_key.upper()} | Buscando en panel: '{date_tag}'")
 
-    url = REPORT_URLS[report_key]
+    url = _make_retail_url(report_key, account)
     page.goto(url, timeout=40000)
 
     h1 = h1_text or report_key.replace("_", " ").title()
@@ -506,8 +672,8 @@ def download_static_report(page: Page, report_key: str,
     if not click_excel(page):
         return False
 
-    # filename=None → download_from_panel usa dl.suggested_filename (nombre real de Amazon)
-    ok, filepath = download_from_panel(page, date_tag)
+    output_dir = (account or {}).get("output_dir", OUTPUT_DIR)
+    ok, filepath = download_from_panel(page, date_tag, output_dir=output_dir)
     if ok and filepath:
         stamp_download_date(filepath)
         upload_file(filepath, account)
@@ -526,7 +692,37 @@ def download_all_reports(page: Page, start: date, end: date,
                    lista   →  solo los reportes cuya clave esté en la lista
                               ej: ["sales", "inventory", "traffic"]
     """
-    setup_output_dir()
+    output_dir = (account or {}).get("output_dir", OUTPUT_DIR)
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+
+    # Cambiar a la cuenta correcta en Vendor Central antes de descargar
+    if account:
+        page.goto("https://vendorcentral.amazon.com", timeout=30000)
+        page.wait_for_load_state("domcontentloaded", timeout=15000)
+        # Esperar a que el botón de cuenta sea visible (shadow DOM traversal)
+        try:
+            page.wait_for_function(
+                """() => {
+                    function getAll(root) {
+                        var nodes = [];
+                        try {
+                            var tw = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
+                            var n; while (n = tw.nextNode()) {
+                                nodes.push(n);
+                                if (n.shadowRoot) nodes = nodes.concat(getAll(n.shadowRoot));
+                            }
+                        } catch(e) {}
+                        return nodes;
+                    }
+                    return getAll(document).some(function(el) {
+                        return (el.textContent || '').trim().startsWith('US - ');
+                    });
+                }""",
+                timeout=15000,
+            )
+        except Exception:
+            time.sleep(5)
+        switch_vendor_central_account(page, account)
 
     run_all = (reports_to_run is None or reports_to_run == "all")
     selected = set() if run_all else set(reports_to_run)

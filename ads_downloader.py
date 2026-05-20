@@ -12,7 +12,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from playwright.sync_api import Page, BrowserContext
 
-from config import OUTPUT_DIR, ADS_REPORT_TIMEOUT_SEC, ADS_POLL_INTERVAL_SEC, SHAREPOINT_ADS_BASE_PATH, ACCOUNT_NAME, HK_ADS_ENTITY_ID
+from config import OUTPUT_DIR, ADS_REPORT_TIMEOUT_SEC, ADS_POLL_INTERVAL_SEC, ACCOUNT_NAME, ACCOUNTS
 from downloader import ensure_page, upload_file, setup_output_dir, _GET_ALL_FN
 
 logger = logging.getLogger(__name__)
@@ -219,7 +219,12 @@ JS_ADS_CLICK_DOWNLOAD_BY_TYPE = """(reportTypeLabel) => {
 # Helpers
 # ---------------------------------------------------------------------------
 
-_hk_entity_id: str = HK_ADS_ENTITY_ID  # entityId de HK Limited (ENTITY2BTHXP5BCM35L)
+# Cache de entityIds por nombre de cuenta: {account_name: entityId}
+_entity_id_cache: dict = {
+    acc["name"]: acc["ads_entity_id"]
+    for acc in ACCOUNTS
+    if acc.get("ads_entity_id")
+}
 
 
 def _get_entity_id(page: Page) -> str:
@@ -342,12 +347,13 @@ def _switch_ads_account(page: Page, account_name: str) -> bool:
     except Exception as e:
         logger.debug(f"option locator: {e}")
 
-    # Fallback JS: matching flexible — busca "HK" + "Honey" en cualquier elemento visible
+    # Fallback JS: matching flexible usando palabras clave del nombre de cuenta
     if not clicked_account:
+        # Generar keywords dinámicamente desde el nombre de cuenta
+        # Palabras de 3+ caracteres que identifican la cuenta
+        keywords = [w for w in account_name.split() if len(w) >= 3]
         try:
-            result = page.evaluate("""(target) => {
-                // Palabras clave del nombre de cuenta — basta con que contenga todas
-                var keywords = ['HK', 'Honey'];
+            result = page.evaluate("""([target, keywords]) => {
                 function matchesAccount(txt) {
                     var t = txt.trim();
                     return keywords.every(function(k){ return t.indexOf(k) >= 0; });
@@ -384,15 +390,16 @@ def _switch_ads_account(page: Page, account_name: str) -> bool:
                     }
                 }
 
-                // Diagnóstico: listar todos los elementos visibles que contengan "HK"
+                // Diagnóstico: listar elementos visibles con la primera keyword
                 var found = [];
+                var kw0 = keywords[0] || '';
                 document.querySelectorAll('*').forEach(function(el) {
                     if (!el.offsetParent) return;
                     var t = el.textContent.trim();
-                    if (t.indexOf('HK') >= 0 && t.length < 80) found.push(t.substring(0,60));
+                    if (t.indexOf(kw0) >= 0 && t.length < 80) found.push(t.substring(0,60));
                 });
-                return 'not_found:hk_visible=' + JSON.stringify(found.slice(0,10));
-            }""", account_name)
+                return 'not_found:visible=' + JSON.stringify(found.slice(0,10));
+            }""", [account_name, keywords])
             if "clicked" in result:
                 clicked_account = True
                 logger.info(f"✓ Cuenta JS: {result}")
@@ -562,38 +569,39 @@ def fill_ads_date_range(page: Page, start: date, end: date) -> bool:
 # Navegación
 # ---------------------------------------------------------------------------
 
-def navigate_to_ads_reports(page: Page) -> bool:
+def navigate_to_ads_reports(page: Page, account: dict = None) -> bool:
     """
-    Navega a Sponsored ads reports de la cuenta Honey Can Do HK Limited.
-    Si ya se cacheó el entityId de HK Limited, usa la URL directa (más rápido para polling).
-    Si no: Paso 1 (base URL + switch de cuenta) → Paso 2 (click menú) → Paso 3 (fallback URL).
+    Navega a Sponsored ads reports de la cuenta indicada.
+    Si se conoce el entityId (config o cache), usa la URL directa.
+    Si no: flujo completo con switch de cuenta.
     """
-    global _hk_entity_id
+    account_name = (account or {}).get("name", ACCOUNT_NAME)
+    entity_id    = (account or {}).get("ads_entity_id") or _entity_id_cache.get(account_name)
 
-    # ── Atajo: URL directa con entityId cacheado ─────────────────────────────
-    if _hk_entity_id:
+    # ── Atajo: URL directa con entityId ──────────────────────────────────────
+    if entity_id:
         try:
-            direct = f"https://advertising.amazon.com/reports?entityId={_hk_entity_id}"
-            logger.info(f"ADS directo (entityId cacheado): {direct}")
+            direct = f"https://advertising.amazon.com/reports?entityId={entity_id}"
+            logger.info(f"ADS directo ({account_name}): {direct}")
             page.goto(direct, timeout=30000)
             page.wait_for_load_state("domcontentloaded", timeout=20000)
             time.sleep(2)
             cur = page.url.lower()
             if any(k in cur for k in ["signin", "login"]):
-                logger.warning("Sesión expirada con entityId cacheado — reiniciando navegación completa.")
-                _hk_entity_id = None  # Limpiar cache y reintentar con flujo completo
+                logger.warning("Sesión expirada con entityId cacheado — flujo completo.")
+                _entity_id_cache.pop(account_name, None)
             else:
                 logger.info(f"✓ ADS Reports (directo): {page.url}")
                 return True
         except Exception as e:
-            logger.warning(f"Atajo entityId falló: {e} — usando flujo completo.")
-            _hk_entity_id = None
+            logger.warning(f"Atajo entityId falló: {e} — flujo completo.")
+            _entity_id_cache.pop(account_name, None)
 
     # ── Flujo completo ─────────────────────────────────────────────────────────
 
     # Paso 1: base URL
     try:
-        logger.info("ADS paso 1: cargando advertising.amazon.com...")
+        logger.info(f"ADS paso 1: cargando advertising.amazon.com ({account_name})...")
         page.goto("https://advertising.amazon.com", timeout=30000)
         page.wait_for_load_state("domcontentloaded", timeout=20000)
         time.sleep(4)
@@ -604,12 +612,12 @@ def navigate_to_ads_reports(page: Page) -> bool:
             return False
         logger.info(f"✓ Base: {page.url}")
 
-        # Verificar cuenta — debe ser Honey Can Do HK Limited
+        # Verificar que estamos en la cuenta correcta
         try:
             body_txt = page.inner_text('body')
-            if ACCOUNT_NAME not in body_txt:
-                logger.info(f"Cuenta incorrecta. Cambiando a: {ACCOUNT_NAME}")
-                _switch_ads_account(page, ACCOUNT_NAME)
+            if account_name not in body_txt:
+                logger.info(f"Cuenta incorrecta. Cambiando a: {account_name}")
+                _switch_ads_account(page, account_name)
                 time.sleep(2)
         except Exception as e:
             logger.debug(f"Verificación de cuenta: {e}")
@@ -647,13 +655,13 @@ def navigate_to_ads_reports(page: Page) -> bool:
         logger.error("ADS: sesión inválida post-navegación.")
         return False
 
-    # Cachear entityId de HK Limited para navegaciones futuras más rápidas
+    # Cachear entityId descubierto para navegaciones futuras
     eid = _get_entity_id(page)
     if eid:
         try:
-            if ACCOUNT_NAME in page.inner_text('body'):
-                _hk_entity_id = eid
-                logger.info(f"✓ EntityId HK Limited cacheado: {_hk_entity_id}")
+            if account_name in page.inner_text('body'):
+                _entity_id_cache[account_name] = eid
+                logger.info(f"✓ EntityId cacheado ({account_name}): {eid}")
         except Exception:
             pass
 
@@ -866,7 +874,7 @@ def wait_and_download_ads_report(page: Page, context: BrowserContext,
         page = ensure_page(context, page)
 
         try:
-            navigate_to_ads_reports(page)
+            navigate_to_ads_reports(page, account)
             time.sleep(2)
         except Exception as e:
             logger.warning(f"navigate: {e}")
@@ -937,7 +945,9 @@ def wait_and_download_ads_report(page: Page, context: BrowserContext,
                                     headers=resp_headers, timeout=60)
 
             if response.status_code == 200:
-                save_path = os.path.join(OUTPUT_DIR, filename)
+                acct_output_dir = (account or {}).get("output_dir", OUTPUT_DIR)
+                Path(acct_output_dir).mkdir(parents=True, exist_ok=True)
+                save_path = os.path.join(acct_output_dir, filename)
                 with open(save_path, 'wb') as f:
                     f.write(response.content)
                 logger.info(f"✓ Descargado: {filename} ({len(response.content):,} bytes)")
@@ -978,7 +988,6 @@ def download_all_ads_reports(page: Page, context: BrowserContext,
     """
     setup_output_dir()
 
-    file_suffix  = (account or {}).get("file_suffix", "HoneyCanDoHK")
     run_all      = (reports_to_run is None or reports_to_run == "all")
     selected     = set() if run_all else set(reports_to_run)
     active_types = [r for r in ADS_REPORT_TYPES if (run_all or r["key"] in selected)]
@@ -987,11 +996,14 @@ def download_all_ads_reports(page: Page, context: BrowserContext,
         logger.warning("Ningún reporte ADS seleccionado.")
         return page
 
-    account_name = (account or {}).get("name", "Honey Can Do HK Limited")
-    ads_account  = dict(account or {})
-    ads_account.setdefault("name", account_name)
-    ads_account.setdefault("file_suffix", file_suffix)
-    ads_account["sp_folder"] = SHAREPOINT_ADS_BASE_PATH
+    # Si no se pasa account, usar la primera cuenta (HK Limited)
+    if account is None:
+        account = ACCOUNTS[0]
+    ads_account      = dict(account)
+    account_name     = ads_account.get("name", ACCOUNT_NAME)
+    file_prefix      = ads_account.get("file_prefix", "Honey")
+    acct_output_dir  = ads_account.get("output_dir", OUTPUT_DIR)
+    Path(acct_output_dir).mkdir(parents=True, exist_ok=True)
 
     logger.info(f"\n{'█' * 50}")
     logger.info(f"ADS REPORTS — {account_name} | {start} → {end}")
@@ -1000,7 +1012,7 @@ def download_all_ads_reports(page: Page, context: BrowserContext,
 
     page = ensure_page(context, page)
 
-    if not navigate_to_ads_reports(page):
+    if not navigate_to_ads_reports(page, ads_account):
         logger.error("No se pudo acceder a Amazon Advertising.")
         return page
 
@@ -1011,12 +1023,12 @@ def download_all_ads_reports(page: Page, context: BrowserContext,
     requested = []
     for rpt in active_types:
         label_clean = rpt['label'].replace(' ', '_')
-        filename = f"Honey_Sponsored_Products_{label_clean}_report_{start.strftime('%Y%m')}.csv"
-        if os.path.exists(os.path.join(OUTPUT_DIR, filename)):
+        filename = f"{file_prefix}_Sponsored_Products_{label_clean}_report_{start.strftime('%Y%m')}.csv"
+        if os.path.exists(os.path.join(acct_output_dir, filename)):
             logger.info(f"Ya existe: {filename}")
             continue
 
-        navigate_to_ads_reports(page)
+        navigate_to_ads_reports(page, ads_account)
         time.sleep(2)
 
         ok = create_ads_report(page, rpt, start, end)
@@ -1038,7 +1050,7 @@ def download_all_ads_reports(page: Page, context: BrowserContext,
     total = 0
     for rpt in requested:
         label_clean = rpt['label'].replace(' ', '_')
-        filename = f"Honey_Sponsored_Products_{label_clean}_report_{start.strftime('%Y%m')}.csv"
+        filename = f"{file_prefix}_Sponsored_Products_{label_clean}_report_{start.strftime('%Y%m')}.csv"
         logger.info(f"\n{'=' * 50}")
         logger.info(f"Esperando: {rpt['label']} (timeout: {rpt['timeout_sec'] // 60} min)")
 

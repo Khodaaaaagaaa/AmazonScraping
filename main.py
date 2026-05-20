@@ -9,6 +9,7 @@ import sys
 import json
 import time
 from pathlib import Path
+import pyotp
 from playwright.sync_api import sync_playwright
 
 from config import START_DATE, END_DATE, OUTPUT_DIR, CHROME_PROFILE_DIR, ACCOUNTS
@@ -262,6 +263,71 @@ def load_cookies(context, cookies_file: Path):
     logger.info(f"✓ {len(cookies)} cookies cargadas.")
 
 
+def auto_login(page, context) -> bool:
+    """
+    Completa el login en Amazon VC usando email, password y TOTP.
+    Si tiene éxito guarda las cookies nuevas en cookies.json.
+    Retorna True si la sesión quedó activa.
+    """
+    from config import EMAIL, PASSWORD, TOTP_SECRET
+    logger.info("Iniciando auto-login...")
+
+    page.goto("https://vendorcentral.amazon.com", timeout=30000)
+    page.wait_for_load_state("domcontentloaded", timeout=15000)
+    time.sleep(2)
+
+    # ── Email ─────────────────────────────────────────────────────────────────
+    try:
+        page.fill('input[type="email"], input[name="email"]', EMAIL, timeout=10000)
+        page.click('input[type="submit"], #continue', timeout=8000)
+        time.sleep(2)
+    except Exception as e:
+        logger.error(f"Auto-login: error en email — {e}")
+        page.screenshot(path="debug_login_email_error.png")
+        return False
+
+    # ── Password ──────────────────────────────────────────────────────────────
+    try:
+        page.fill('input[type="password"], input[name="password"]', PASSWORD, timeout=10000)
+        page.click('input[type="submit"], #signInSubmit', timeout=8000)
+        time.sleep(2)
+    except Exception as e:
+        logger.error(f"Auto-login: error en password — {e}")
+        page.screenshot(path="debug_login_password_error.png")
+        return False
+
+    # ── OTP ───────────────────────────────────────────────────────────────────
+    url_after_pw = page.url
+    if any(k in url_after_pw.lower() for k in ["mfa", "otp", "auth", "code"]):
+        try:
+            otp_code = pyotp.TOTP(TOTP_SECRET).now()
+            logger.info(f"OTP generado: {otp_code}")
+            page.fill('input[type="text"], input[name="otpCode"], input[id*="otp"]',
+                      otp_code, timeout=10000)
+            page.click('input[type="submit"], button[type="submit"]', timeout=8000)
+            time.sleep(3)
+        except Exception as e:
+            logger.error(f"Auto-login: error en OTP — {e}")
+            page.screenshot(path="debug_login_otp_error.png")
+            return False
+
+    # ── Verificar y guardar cookies ───────────────────────────────────────────
+    final_url = page.url
+    bad = ["signin", "ap/signin", "ap/mfa", "login", "ap/captcha"]
+    if any(k in final_url.lower() for k in bad):
+        logger.error(f"Auto-login falló — URL: {final_url}")
+        page.screenshot(path="debug_login_failed.png")
+        return False
+
+    cookies = context.cookies()
+    COOKIES_FILE.write_text(
+        json.dumps(cookies, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    logger.info(f"✓ Auto-login exitoso — {len(cookies)} cookies guardadas.")
+    return True
+
+
 def verify_session(page) -> bool:
     logger.info("Verificando sesión con cookies...")
     page.goto("https://vendorcentral.amazon.com", timeout=30000)
@@ -289,12 +355,7 @@ def main():
     logger.info("=" * 60)
 
     if not COOKIES_FILE.exists():
-        logger.error("No se encontró cookies.json")
-        logger.error("1. Instalar Cookie Editor en Edge")
-        logger.error("2. Ir a vendorcentral.amazon.com logueado")
-        logger.error("3. Abrir Cookie Editor -> Export -> Export as JSON")
-        logger.error("4. Guardar el contenido en cookies.json en esta carpeta")
-        sys.exit(1)
+        logger.warning("No se encontró cookies.json — se intentará auto-login.")
 
     Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
     profile_path = str(Path(CHROME_PROFILE_DIR).resolve())
@@ -356,11 +417,25 @@ def main():
         """)
 
         try:
-            load_cookies(context, COOKIES_FILE)
+            if COOKIES_FILE.exists():
+                load_cookies(context, COOKIES_FILE)
 
             if not verify_session(page):
-                logger.error("Cookies inválidas. Exportalas de nuevo desde Edge.")
-                sys.exit(1)
+                logger.warning("Cookies expiradas o inválidas — iniciando auto-login...")
+                logged_in = False
+                for attempt in range(1, 4):
+                    logger.info(f"Auto-login intento {attempt}/3...")
+                    if auto_login(page, context):
+                        logged_in = True
+                        break
+                    logger.warning(f"Intento {attempt} fallido.")
+                    time.sleep(5)
+                    page.goto("https://vendorcentral.amazon.com", timeout=30000)
+                    time.sleep(2)
+
+                if not logged_in:
+                    logger.error("Auto-login falló en los 3 intentos. Revisá debug_login_*.png")
+                    sys.exit(1)
 
             # ── Iterar sobre las cuentas seleccionadas ────────────────────────
             for account in selected_accounts:

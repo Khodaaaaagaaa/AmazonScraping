@@ -239,7 +239,11 @@ def select_ads_dates_interactively():
 
 def load_cookies(context, cookies_file: Path):
     logger.info(f"Cargando cookies desde {cookies_file}...")
-    raw = json.loads(cookies_file.read_text(encoding="utf-8"))
+    try:
+        raw = json.loads(cookies_file.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, ValueError):
+        logger.warning("cookies.json vacío o inválido — se omite la carga.")
+        return
 
     cookies = []
     for c in raw:
@@ -266,39 +270,66 @@ def load_cookies(context, cookies_file: Path):
 def auto_login(page, context) -> bool:
     """
     Completa el login en Amazon VC usando email, password y TOTP.
+    Misma lógica que test_login.py: screenshots en cada paso para diagnóstico.
     Si tiene éxito guarda las cookies nuevas en cookies.json.
     Retorna True si la sesión quedó activa.
     """
     from config import EMAIL, PASSWORD, TOTP_SECRET
-    logger.info("Iniciando auto-login...")
 
+    logger.info("Navegando a Vendor Central...")
     page.goto("https://vendorcentral.amazon.com", timeout=30000)
     page.wait_for_load_state("domcontentloaded", timeout=15000)
     time.sleep(2)
 
-    # ── Email ─────────────────────────────────────────────────────────────────
+    url = page.url
+    logger.info(f"URL inicial: {url}")
+
+    # Si ya está logueado no hacer nada
+    if not any(k in url.lower() for k in ["signin", "ap/signin", "login"]):
+        logger.info("✓ Ya hay sesión activa — no se necesita login.")
+        return True
+
+    # ── Paso 1: Email ─────────────────────────────────────────────────────────
+    logger.info("Ingresando email...")
+    page.screenshot(path="debug_login_01_email.png")
     try:
         page.fill('input[type="email"], input[name="email"]', EMAIL, timeout=10000)
         page.click('input[type="submit"], #continue', timeout=8000)
         time.sleep(2)
+        # Edge abre diálogo de Windows Hello / passkey después del email.
+        # Escape lo descarta sin importar si apareció o no.
+        page.keyboard.press('Escape')
+        time.sleep(0.5)
     except Exception as e:
         logger.error(f"Auto-login: error en email — {e}")
-        page.screenshot(path="debug_login_email_error.png")
+        page.screenshot(path="debug_login_01_email_error.png")
         return False
 
-    # ── Password ──────────────────────────────────────────────────────────────
+    # ── Paso 2: Password ──────────────────────────────────────────────────────
+    logger.info("Ingresando password...")
+    page.screenshot(path="debug_login_02_password.png")
     try:
         page.fill('input[type="password"], input[name="password"]', PASSWORD, timeout=10000)
-        page.click('input[type="submit"], #signInSubmit', timeout=8000)
-        time.sleep(2)
+        # form.submit() bypasses todos los event listeners (incluyendo passkey interceptor)
+        page.evaluate("document.getElementById('signInSubmit').form.submit()")
+        # Esperar a que la URL cambie de ap/signin (puede redirigir a MFA o a VC)
+        try:
+            page.wait_for_url(lambda url: "ap/signin" not in url, timeout=15000)
+        except Exception:
+            pass
+        time.sleep(1)
     except Exception as e:
         logger.error(f"Auto-login: error en password — {e}")
-        page.screenshot(path="debug_login_password_error.png")
+        page.screenshot(path="debug_login_02_password_error.png")
         return False
 
-    # ── OTP ───────────────────────────────────────────────────────────────────
+    # ── Paso 3: OTP / MFA ─────────────────────────────────────────────────────
     url_after_pw = page.url
-    if any(k in url_after_pw.lower() for k in ["mfa", "otp", "auth", "code"]):
+    logger.info(f"URL tras password: {url_after_pw}")
+    page.screenshot(path="debug_login_03_mfa.png")
+
+    mfa_keywords = ["mfa", "otp", "auth", "code", "claimspicker", "accountfixup"]
+    if any(k in url_after_pw.lower() for k in mfa_keywords):
         try:
             otp_code = pyotp.TOTP(TOTP_SECRET).now()
             logger.info(f"OTP generado: {otp_code}")
@@ -308,15 +339,19 @@ def auto_login(page, context) -> bool:
             time.sleep(3)
         except Exception as e:
             logger.error(f"Auto-login: error en OTP — {e}")
-            page.screenshot(path="debug_login_otp_error.png")
+            page.screenshot(path="debug_login_03_mfa_error.png")
             return False
+    else:
+        logger.info("No se detectó pantalla MFA — saltando paso OTP.")
 
     # ── Verificar y guardar cookies ───────────────────────────────────────────
+    page.screenshot(path="debug_login_04_result.png")
     final_url = page.url
+    logger.info(f"URL final: {final_url}")
+
     bad = ["signin", "ap/signin", "ap/mfa", "login", "ap/captcha"]
     if any(k in final_url.lower() for k in bad):
-        logger.error(f"Auto-login falló — URL: {final_url}")
-        page.screenshot(path="debug_login_failed.png")
+        logger.error(f"Auto-login falló — todavía en página de autenticación. URL: {final_url}")
         return False
 
     cookies = context.cookies()
@@ -387,12 +422,17 @@ def main():
 
     # ── Browser ───────────────────────────────────────────────────────────────
     with sync_playwright() as p:
+        browser_args = [
+            "--disable-blink-features=AutomationControlled",
+            "--disable-features=WebAuthentication",
+            "--password-store=basic",  # evita el diálogo de Windows Hello / Credential Manager
+        ]
         try:
             context = p.chromium.launch_persistent_context(
                 user_data_dir=profile_path,
                 headless=False,
                 channel="msedge",
-                args=["--disable-blink-features=AutomationControlled"],
+                args=browser_args,
                 viewport={"width": 1366, "height": 768},
                 locale="en-US",
                 accept_downloads=True,
@@ -403,7 +443,7 @@ def main():
             context = p.chromium.launch_persistent_context(
                 user_data_dir=profile_path,
                 headless=False,
-                args=["--disable-blink-features=AutomationControlled"],
+                args=browser_args,
                 viewport={"width": 1366, "height": 768},
                 locale="en-US",
                 accept_downloads=True,

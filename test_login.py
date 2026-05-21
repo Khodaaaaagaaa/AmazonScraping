@@ -47,35 +47,44 @@ def do_login(page) -> bool:
     url = page.url
     logger.info(f"URL inicial: {url}")
 
+    # Si ya está logueado no hacer nada
     if not any(k in url.lower() for k in ["signin", "ap/signin", "login"]):
         logger.info("✓ Ya hay sesión activa — no se necesita login.")
         return True
 
-    # Paso 1: Email 
+    # ── Paso 1: Email ─────────────────────────────────────────────────────────
     logger.info("Ingresando email...")
     page.screenshot(path="debug_login_01_email.png")
     try:
         page.fill('input[type="email"], input[name="email"]', cfg.EMAIL, timeout=10000)
         page.click('input[type="submit"], #continue', timeout=8000)
         time.sleep(2)
+        # Edge abre diálogo de Windows Hello / passkey después del email.
+        # Escape lo descarta sin importar si apareció o no.
+        page.keyboard.press('Escape')
+        time.sleep(0.5)
     except Exception as e:
         logger.error(f"Error en campo email: {e}")
         page.screenshot(path="debug_login_01_email_error.png")
         return False
 
-    # Paso 2: Password 
+    # ── Paso 2: Password ──────────────────────────────────────────────────────
     logger.info("Ingresando password...")
     page.screenshot(path="debug_login_02_password.png")
     try:
         page.fill('input[type="password"], input[name="password"]', cfg.PASSWORD, timeout=10000)
-        page.click('input[type="submit"], #signInSubmit', timeout=8000)
-        time.sleep(2)
+        page.evaluate("document.getElementById('signInSubmit').form.submit()")
+        try:
+            page.wait_for_url(lambda url: "ap/signin" not in url, timeout=15000)
+        except Exception:
+            pass
+        time.sleep(1)
     except Exception as e:
         logger.error(f"Error en campo password: {e}")
         page.screenshot(path="debug_login_02_password_error.png")
         return False
 
-    # Paso 3: OTP / MFA 
+    # ── Paso 3: OTP / MFA ─────────────────────────────────────────────────────
     url_after_pw = page.url
     logger.info(f"URL tras password: {url_after_pw}")
     page.screenshot(path="debug_login_03_mfa.png")
@@ -132,6 +141,7 @@ def main():
         logger.error("TOTP_SECRET no configurado en config.py")
         sys.exit(1)
 
+    # Verificar que pyotp está instalado
     try:
         test_otp = pyotp.TOTP(cfg.TOTP_SECRET).now()
         logger.info(f"OTP de prueba generado correctamente: {test_otp}")
@@ -141,12 +151,17 @@ def main():
         sys.exit(1)
 
     with sync_playwright() as p:
+        browser_args = [
+            "--disable-blink-features=AutomationControlled",
+            "--disable-features=WebAuthentication",
+            "--password-store=basic",
+        ]
         try:
             context = p.chromium.launch_persistent_context(
                 user_data_dir=str(PROFILE_DIR),
                 headless=False,
                 channel="msedge",
-                args=["--disable-blink-features=AutomationControlled"],
+                args=browser_args,
                 viewport={"width": 1366, "height": 768},
                 locale="en-US",
             )
@@ -155,7 +170,7 @@ def main():
             context = p.chromium.launch_persistent_context(
                 user_data_dir=str(PROFILE_DIR),
                 headless=False,
-                args=["--disable-blink-features=AutomationControlled"],
+                args=browser_args,
                 viewport={"width": 1366, "height": 768},
                 locale="en-US",
             )
@@ -183,6 +198,7 @@ def main():
                 if attempt < 3:
                     logger.info("Esperando 5 segundos antes del siguiente intento...")
                     time.sleep(5)
+                    # Volver a la página de login para reintentar
                     page.goto(LOGIN_URL, timeout=30000)
                     time.sleep(2)
 

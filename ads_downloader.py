@@ -711,20 +711,75 @@ def create_ads_report(page: Page, report_cfg: dict, start: date, end: date) -> b
         page.screenshot(path=f"debug_ads_form_{label.replace(' ', '_')}.png")
         logger.info(f"Formulario: {page.url}")
 
-        # ── MRC checkbox ──────────────────────────────────────────────────────
+                # ── MRC checkbox ──────────────────────────────────────────────────────
         if mrc:
             try:
-                checkboxes = page.locator('input[type="checkbox"]').all()
-                for cb in checkboxes:
-                    parent_txt = cb.evaluate("el => (el.closest('label') || el.parentElement || {}).textContent || ''")
-                    if "MRC" in parent_txt or "Media Rating" in parent_txt:
-                        if not cb.is_checked():
-                            cb.click()
-                            logger.info("✓ MRC activado")
-                            time.sleep(0.5)
-                        break
+                logger.info("Buscando checkbox MRC...")
+
+                page.get_by_text("Show only Media Rating Council", exact=False).wait_for(
+                    state="visible",
+                    timeout=10000
+                )
+
+                mrc_checkbox = page.locator(
+                    "xpath=//*[contains(normalize-space(.), 'Show only Media Rating Council') "
+                    "and .//input[@type='checkbox']]//input[@type='checkbox']"
+                ).first
+
+                if mrc_checkbox.count() == 0:
+                    raise Exception("No se encontró input checkbox de MRC")
+
+                if not mrc_checkbox.is_checked():
+                    mrc_checkbox.check(force=True)
+                    logger.info("✓ MRC activado")
+                else:
+                    logger.info("✓ MRC ya estaba activado")
+
+                time.sleep(0.5)
+
             except Exception as e:
-                logger.debug(f"MRC: {e}")
+                logger.warning(f"MRC: no se pudo activar con locator: {e}")
+
+                try:
+                    result = page.evaluate("""
+                    () => {
+                        const text = 'Show only Media Rating Council';
+                        const nodes = Array.from(document.querySelectorAll('label, div, span, section, form'));
+
+                        for (const node of nodes) {
+                            const nodeText = (node.innerText || node.textContent || '').trim();
+
+                            if (!nodeText.includes(text)) {
+                                continue;
+                            }
+
+                            const checkbox = node.querySelector('input[type="checkbox"]');
+
+                            if (!checkbox) {
+                                continue;
+                            }
+
+                            if (!checkbox.checked) {
+                                checkbox.click();
+                            }
+
+                            return checkbox.checked ? 'checked' : 'clicked';
+                        }
+
+                        return 'not_found';
+                    }
+                    """)
+
+                    if result in ["checked", "clicked"]:
+                        logger.info("✓ MRC activado con JS fallback")
+                        time.sleep(0.5)
+                    else:
+                        logger.warning(f"MRC: no encontrado en fallback JS ({result})")
+                        page.screenshot(path=f"debug_mrc_{label.replace(' ', '_')}.png")
+
+                except Exception as e2:
+                    logger.warning(f"MRC fallback JS error: {e2}")
+                    page.screenshot(path=f"debug_mrc_{label.replace(' ', '_')}.png")
 
         # ── Report type dropdown ──────────────────────────────────────────────
         if label != "Search term":
